@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
+from snowflake.snowpark import Session
 import os
 from dotenv import load_dotenv
 from typing import Optional
@@ -24,19 +25,24 @@ def get_snowflake_connection():
     """Get or create Snowflake connection"""
     if st.session_state.connection is None:
         try:
-            st.session_state.connection = snowflake.connector.connect(
-                user=os.getenv("SNOWFLAKE_USER"),
-                password=os.getenv("SNOWFLAKE_PASSWORD"),
-                account=os.getenv("SNOWFLAKE_ACCOUNT"),
-                warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-                database=os.getenv("SNOWFLAKE_DATABASE", "SNOWFLAKE"),
-                schema=os.getenv("SNOWFLAKE_SCHEMA", "LOCAL"),
-                role=os.getenv("SNOWFLAKE_ROLE", "ACCOUNTADMIN")
-            )
-            st.success("✅ Connected to Snowflake")
+            session = Session.get_active_session()
+            st.session_state.connection = session
+            # st.success("✅ Connected to Snowflake via get_active_session()")
         except Exception as e:
-            st.error(f"❌ Connection failed: {e}")
-            return None
+            try: 
+                st.session_state.connection = snowflake.connector.connect(
+                    user=os.getenv("SNOWFLAKE_USER"),
+                    password=os.getenv("SNOWFLAKE_PASSWORD"),
+                    account=os.getenv("SNOWFLAKE_ACCOUNT"),
+                    warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
+                    database=os.getenv("SNOWFLAKE_DATABASE", "SNOWFLAKE"),
+                    schema=os.getenv("SNOWFLAKE_SCHEMA", "LOCAL"),
+                    role=os.getenv("SNOWFLAKE_ROLE", "ACCOUNTADMIN")
+                )
+                # st.success("✅ Connected to Snowflake")
+            except Exception as connection_failed:
+                st.error(f"❌ Connection failed: {connection_failed}")
+                return None
     return st.session_state.connection
 
 def build_query(agent_name: Optional[str] = None, thread_id: Optional[str] = None) -> str:
@@ -115,59 +121,26 @@ ORDER BY TS ASC
     
     return query
 
-def execute_query(conn, query: str) -> pd.DataFrame:
+def execute_query(session, query: str) -> pd.DataFrame:
     """Execute query and return results as pandas DataFrame"""
     try:
-        cursor = conn.cursor()
-        cursor.execute(query)
-        
-        # Get column names and data
-        columns = [desc[0] for desc in cursor.description]
-        results = cursor.fetchall()
-        cursor.close()
+        data = session.sql(query)
         
         # Convert to DataFrame
-        df = pd.DataFrame(results, columns=columns)
+        df = data.to_pandas()
         return df
     except Exception as e:
         st.error(f"Query execution failed: {e}")
         raise
 
-def write_to_table(conn, df: pd.DataFrame, table_name: str, database: Optional[str] = None, 
+def write_to_table(session, df: pd.DataFrame, table_name: str, database: Optional[str] = None, 
                    schema: Optional[str] = None, overwrite: bool = False) -> bool:
     """Write DataFrame to Snowflake table"""
     try:
         # Parse table name (could be DATABASE.SCHEMA.TABLE or TABLE)
-        parts = table_name.upper().split('.')
-        if len(parts) == 3:
-            target_database, target_schema, target_table = parts
-        elif len(parts) == 1:
-            target_table = parts[0]
-            target_database = database or os.getenv("SNOWFLAKE_DATABASE", "SNOWFLAKE")
-            target_schema = schema or os.getenv("SNOWFLAKE_SCHEMA", "LOCAL")
-        else:
-            st.error("Invalid table name format. Use DATABASE.SCHEMA.TABLE or TABLE")
-            return False
+        target_table = table_name.upper()
         
-        # Set database and schema context
-        cursor = conn.cursor()
-        cursor.execute(f"USE DATABASE {target_database}")
-        cursor.execute(f"USE SCHEMA {target_schema}")
-        cursor.close()
-        
-        # Use write_pandas to write data (overwrite parameter handles table dropping)
-        success, nchunks, nrows, output = write_pandas(
-            conn,
-            df,
-            target_table,
-            database=target_database,
-            schema=target_schema,
-            auto_create_table=True,
-            overwrite=overwrite
-        )
-        
-        if success:
-            st.info(f"Wrote {nrows} rows in {nchunks} chunks")
+        success = session.write_pandas(df, target_table, auto_create_table = True, overwrite=overwrite)
         
         return success
     except Exception as e:
@@ -181,10 +154,7 @@ st.markdown("Query and analyze AI observability events from Snowflake")
 # Sidebar for connection and filters
 with st.sidebar:
     st.header("Configuration")
-    
-    # Connection status
-    if st.button("Connect to Snowflake"):
-        conn = get_snowflake_connection()
+    session = get_snowflake_connection()
     
     if st.session_state.connection:
         st.success("✅ Connected")
@@ -209,14 +179,14 @@ if st.session_state.connection:
     with col2:
         if st.button("🔄 Run Query", type="primary"):
             with st.spinner("Executing query..."):
-                conn = st.session_state.connection
+                session = st.session_state.connection
                 query = build_query(
                     agent_name=agent_name.strip() if agent_name else None,
                     thread_id=thread_id.strip() if thread_id else None
                 )
                 
                 try:
-                    df = execute_query(conn, query)
+                    df = execute_query(session, query)
                     st.session_state.query_results = df
                     st.session_state.query_executed = True
                     st.rerun()
@@ -250,29 +220,27 @@ if st.session_state.connection:
         
         with col1:
             table_name = st.text_input(
-                "Table Name",
-                value="",
-                placeholder="DATABASE.SCHEMA.TABLE_NAME or TABLE_NAME",
-                help="Enter either full path (DATABASE.SCHEMA.TABLE) or just table name"
+                "Table Name (Use DATABASE.SCHEMA.TABLE_NAME format",
+                value=f"AGENT_EVAL_DB.{agent_name or 'EVAL_SETS'}.EVAL_DATASET_v0",
+                placeholder=f"AGENT_EVAL_DB.{agent_name or 'EVAL_SETS'}.EVAL_DATASET_v0",
+                help="Enter full path (DATABASE.SCHEMA.TABLE)"
             )
         
         with col2:
             overwrite = st.checkbox("Overwrite table", value=False, help="If checked, will drop and recreate the table")
         
-        with col3:
-            st.write("")  # Spacing
-            st.write("")  # Spacing
-            if st.button("📤 Write to Table", type="primary"):
-                if table_name.strip():
-                    with st.spinner("Writing data to table..."):
-                        conn = st.session_state.connection
-                        success = write_to_table(conn, df, table_name.strip(), overwrite=overwrite)
-                        if success:
-                            st.success(f"✅ Successfully wrote {len(df)} rows to {table_name}")
-                        else:
-                            st.error("❌ Failed to write data to table")
-                else:
-                    st.warning("⚠️ Please enter a table name")
+        st.write("")  # Spacing
+        st.write("")  # Spacing
+        if st.button("📤 Write to Table", type="primary"):
+            if table_name.strip():
+                with st.spinner("Writing data to table..."):
+                    success = write_to_table(session, df, table_name.strip(), overwrite=overwrite)
+                    if success:
+                        st.success(f"✅ Successfully wrote {len(df)} rows to {table_name}")
+                    else:
+                        st.error("❌ Failed to write data to table")
+            else:
+                st.warning("⚠️ Please enter a table name")
         
         # Show query for reference
         with st.expander("📋 View Generated SQL Query"):
