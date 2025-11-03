@@ -6,6 +6,8 @@ from snowflake.snowpark import Session
 import os
 from dotenv import load_dotenv
 from typing import Optional
+import ast
+import json
 
 # Load environment variables
 load_dotenv()
@@ -112,22 +114,64 @@ SELECT
     ARRAY_AGG(AGENT_RESPONSE) WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS AGENT_RESPONSE,
     ARRAY_AGG(AGENT_PLANNING) WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS AGENT_PLANNING,
     ARRAY_AGG(TOOL_SELECTION) WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS TOOL_CALLS,
-    ARRAY_AGG(COALESCE(GENERATED_SQL, SQL_RESULT, CORTEX_SEARCH_RESULT, CUSTOM_TOOL_RESULT))  
-    WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS TOOL_RESULTS
+    ARRAY_AGG(COALESCE(GENERATED_SQL, SQL_RESULT, CORTEX_SEARCH_RESULT, CUSTOM_TOOL_RESULT))   
+    WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS TOOL_RESULTS,
+    ARRAY_AGG(USER_FEEDBACK) AS USER_FEEDBACKS,
+    ARRAY_AGG(USER_FEEDBACK_MESSAGE) AS USER_FEEDBACK_MESSAGES
+    
 FROM RESULTS
 GROUP BY THREAD_MESSAGE_ID
-ORDER BY TS ASC
 """
+    feedback_filter = []
+    if user_feedback == 'Positive Feedback Only':
+        feedback_filter.append(f"HAVING USER_FEEDBACKS[0] = 1")
+    elif user_feedback == 'Negative Feedback Only':
+        feedback_filter.append(f"HAVING USER_FEEDBACKS[0] = 0")
+    elif user_feedback == 'Any Feedback':
+        feedback_filter.append(f"HAVING USER_FEEDBACKS[0] IS NOT NULL")
+    query += " ".join(feedback_filter)
+    
+    query += """
+    ORDER BY TS ASC
+    """
     
     return query
 
-def execute_query(session, query: str) -> pd.DataFrame:
-    """Execute query and return results as pandas DataFrame"""
+def convert_tools_list_to_sequence_dict(tool_list):
+    """
+    Convert a list of tool names into a list of dictionaries with tool names and sequence numbers
+    
+    Args:
+        tool_list (list): List of tool names
+        
+    Returns:
+        list: List of dictionaries containing tool_name and tool_sequence
+    """
+    return [
+        {
+            'tool_name': ast.literal_eval(tool)[0],
+            'tool_sequence': str(idx + 1)
+        }
+        for idx, tool in enumerate(tool_list)
+    ]
+
+def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
+    """Execute query and return results as pandas DataFrame
+        Perform some operations in pandas to clean up data."""
     try:
         data = session.sql(query)
         
         # Convert to DataFrame
         df = data.to_pandas()
+
+        #Pandas post processing section
+
+        #Drop duplicate queries
+        df.drop_duplicates(subset=['AGENT_NAME', 'INPUT_QUERIES'], inplace=True)
+        
+        #Create tool selection sequence
+        df['TOOL_SELECTION'] = df.TOOL_CALLS.apply(lambda x: json.dumps(convert_tools_list_to_sequence_dict(ast.literal_eval(x))))
+        
         return df
     except Exception as e:
         st.error(f"Query execution failed: {e}")
@@ -165,6 +209,11 @@ with st.sidebar:
     st.header("Filters")
     agent_name = st.text_input("AGENT_NAME (optional)", value="")
     thread_id = st.text_input("THREAD_ID (optional)", value="")
+    user_feedback = st.selectbox(
+                        "User Feedback:",
+                        ("Positive Feedback Only", "Negative Feedback Only", "Any Feedback"),
+                        index=None,
+                        placeholder= "Select Option")
     
     st.markdown("**Note:** Leave filters empty to see all results")
 
@@ -186,7 +235,7 @@ if st.session_state.connection:
                 )
                 
                 try:
-                    df = execute_query(session, query)
+                    df = execute_query_and_postprocess(session, query)
                     st.session_state.query_results = df
                     st.session_state.query_executed = True
                     st.rerun()
