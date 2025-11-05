@@ -184,140 +184,20 @@ def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
 
 def write_to_table(session, df: pd.DataFrame, table_name: str, database: Optional[str] = None, 
                    schema: Optional[str] = None, overwrite: bool = False) -> bool:
-    """Write DataFrame to Snowflake table using SQL INSERT to avoid stage creation issues"""
+    """Write DataFrame to Snowflake table"""
     try:
         # Parse table name (could be DATABASE.SCHEMA.TABLE or TABLE)
         target_table = table_name.upper()
         
         # Handle both Snowpark Session and connector connection
-        if hasattr(session, 'sql'):
-            # Snowpark Session - use SQL INSERT with VALUES to avoid stage creation issues
-            # Handle overwrite
-            if overwrite:
-                try:
-                    session.sql(f"DROP TABLE IF EXISTS {target_table}").collect()
-                except:
-                    pass  # Table might not exist, continue
-            
-            # Create table if it doesn't exist
-            columns = []
-            for col in df.columns:
-                # Infer SQL type from pandas dtype
-                if pd.api.types.is_integer_dtype(df[col]):
-                    sql_type = "NUMBER"
-                elif pd.api.types.is_float_dtype(df[col]):
-                    sql_type = "FLOAT"
-                elif pd.api.types.is_bool_dtype(df[col]):
-                    sql_type = "BOOLEAN"
-                elif pd.api.types.is_datetime64_any_dtype(df[col]):
-                    sql_type = "TIMESTAMP_NTZ"
-                else:
-                    sql_type = "VARIANT"  # For complex types like arrays/JSON
-                columns.append(f'"{col}" {sql_type}')
-            
-            create_table_sql = f"CREATE TABLE IF NOT EXISTS {target_table} ({', '.join(columns)})"
-            session.sql(create_table_sql).collect()
-            
-            # Insert data using direct SQL INSERT with VALUES to avoid stage creation
-            if len(df) > 0:
-                columns_str = ', '.join([f'"{col}"' for col in df.columns])
-                
-                # Insert in batches to avoid SQL statement length limits
-                batch_size = 100
-                for i in range(0, len(df), batch_size):
-                    batch_df = df.iloc[i:i+batch_size]
-                    values_list = []
-                    
-                    for _, row in batch_df.iterrows():
-                        row_values = []
-                        for val in row:
-                            if pd.isna(val):
-                                row_values.append("NULL")
-                            elif isinstance(val, (list, dict)):
-                                # Convert to JSON string for VARIANT columns
-                                json_str = json.dumps(val).replace("'", "''")
-                                row_values.append(f"PARSE_JSON('{json_str}')")
-                            elif isinstance(val, str):
-                                # Escape single quotes in strings
-                                val_str = str(val).replace("'", "''")
-                                row_values.append(f"'{val_str}'")
-                            elif isinstance(val, (int, float)):
-                                row_values.append(str(val))
-                            else:
-                                # For other types, convert to string and escape
-                                val_str = str(val).replace("'", "''")
-                                row_values.append(f"'{val_str}'")
-                        
-                        values_list.append(f"({', '.join(row_values)})")
-                    
-                    # Execute INSERT statement
-                    insert_sql = f"INSERT INTO {target_table} ({columns_str}) VALUES {', '.join(values_list)}"
-                    session.sql(insert_sql).collect()
-            
-            return True
+        if hasattr(session, 'write_pandas'):
+            # Snowpark Session
+            success = session.write_pandas(df, target_table, auto_create_table=True, overwrite=overwrite)
         else:
-            # Connector connection - use SQL INSERT with parameterized queries
-            cursor = session.cursor()
-            
-            try:
-                # Handle overwrite
-                if overwrite:
-                    cursor.execute(f"DROP TABLE IF EXISTS {target_table}")
-                
-                # Create table if it doesn't exist
-                # Get column types from DataFrame
-                columns = []
-                for col in df.columns:
-                    # Infer SQL type from pandas dtype
-                    if pd.api.types.is_integer_dtype(df[col]):
-                        sql_type = "NUMBER"
-                    elif pd.api.types.is_float_dtype(df[col]):
-                        sql_type = "FLOAT"
-                    elif pd.api.types.is_bool_dtype(df[col]):
-                        sql_type = "BOOLEAN"
-                    elif pd.api.types.is_datetime64_any_dtype(df[col]):
-                        sql_type = "TIMESTAMP_NTZ"
-                    else:
-                        sql_type = "VARIANT"  # For complex types like arrays/JSON
-                    columns.append(f'"{col}" {sql_type}')
-                
-                create_table_sql = f"CREATE TABLE IF NOT EXISTS {target_table} ({', '.join(columns)})"
-                cursor.execute(create_table_sql)
-                
-                # Insert data using executemany for better performance
-                if len(df) > 0:
-                    # Prepare data for insertion
-                    placeholders = ', '.join(['?' for _ in df.columns])
-                    columns_str = ', '.join([f'"{col}"' for col in df.columns])
-                    insert_sql = f"INSERT INTO {target_table} ({columns_str}) VALUES ({placeholders})"
-                    
-                    # Convert DataFrame rows to list of tuples, handling complex types
-                    rows_to_insert = []
-                    for _, row in df.iterrows():
-                        row_values = []
-                        for val in row:
-                            if pd.isna(val):
-                                row_values.append(None)
-                            elif isinstance(val, (list, dict)):
-                                # Convert to JSON string for VARIANT columns
-                                row_values.append(json.dumps(val))
-                            else:
-                                row_values.append(val)
-                        rows_to_insert.append(tuple(row_values))
-                    
-                    # Execute in batches
-                    batch_size = 1000
-                    for i in range(0, len(rows_to_insert), batch_size):
-                        batch = rows_to_insert[i:i+batch_size]
-                        cursor.executemany(insert_sql, batch)
-                
-                cursor.close()
-                return True
-                
-            except Exception as insert_error:
-                cursor.close()
-                raise insert_error
-                
+            # Connector connection - use write_pandas from snowflake.connector.pandas_tools
+            success = write_pandas(session, df, target_table, auto_create_table=True, overwrite=overwrite)
+        
+        return success
     except Exception as e:
         st.error(f"Failed to write to table: {e}")
         return False
