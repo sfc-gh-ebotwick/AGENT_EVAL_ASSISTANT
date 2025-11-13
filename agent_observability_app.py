@@ -56,48 +56,56 @@ def build_query(agent_name: Optional[str] = None, thread_id: Optional[str] = Non
     
     # Base query
     query = """
-WITH RESULTS AS (
-    SELECT 
-        TIMESTAMP AS TS,
-        RECORD_ATTRIBUTES:"snow.ai.observability.object.name" AS AGENT_NAME,
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.thread_id" AS THREAD_ID,
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.parent_message_id" AS PARENT_MESSAGE_ID,
-        COALESCE(
-            PARENT_MESSAGE_ID,
-            LAST_VALUE (PARENT_MESSAGE_ID) IGNORE NULLS OVER (
-              PARTITION BY AGENT_NAME,
-              THREAD_ID
-              ORDER BY
-                TIMESTAMP ROWS BETWEEN UNBOUNDED PRECEDING
-                AND CURRENT ROW
-            )
-          ) AS PARENT_MESSAGE,
+WITH RESULTS AS (SELECT 
+    TIMESTAMP AS TS,
+    RECORD_ATTRIBUTES:"snow.ai.observability.object.name" AS AGENT_NAME,
+    RECORD_ATTRIBUTES:"ai.observability.record_id" AS RECORD_ID, 
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.thread_id" AS THREAD_ID,
+    RECORD_ATTRIBUTES:"ai.observability.record_root.input" AS INPUT_QUERY,
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.planning.thinking_response" AS AGENT_PLANNING,
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.cortex_analyst.sql_query" AS GENERATED_SQL,
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.sql_execution.result" AS SQL_RESULT,
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.cortex_search.results" AS CORTEX_SEARCH_RESULT,
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.custom_tool.results" AS CUSTOM_TOOL_RESULT,
+    RECORD_ATTRIBUTES:"ai.observability.record_root.output" AS AGENT_RESPONSE, 
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.planning.model" AS REASONING_MODEL, 
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.planning.tool.name" AS AVAILABLE_TOOLS, 
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.planning.tool_selection.name" AS TOOL_SELECTION,
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.cortex_search.name" AS CSS_NAME,
 
-        CONCAT(THREAD_ID, '-', PARENT_MESSAGE) AS THREAD_MESSAGE_ID,
+    RECORD:"name" as TOOL_CALL,
 
-        VALUE:"snow.ai.observability.request_body"."messages"[0]."content"[0]."text" AS INPUT_QUERY,
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.planning.thinking_response" AS AGENT_PLANNING,
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.cortex_analyst.sql_query" AS GENERATED_SQL,
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.sql_execution.result" AS SQL_RESULT,
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.cortex_search.results" AS CORTEX_SEARCH_RESULT,
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.custom_tool.results" AS CUSTOM_TOOL_RESULT,
-        RECORD_ATTRIBUTES:"ai.observability.record_root.output" AS AGENT_RESPONSE, 
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.planning.model" AS REASONING_MODEL, 
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.planning.tool.name" AS AVAILABLE_TOOLS, 
-        RECORD_ATTRIBUTES:"snow.ai.observability.agent.planning.tool_selection.name" AS TOOL_SELECTION,
-        CASE
-            WHEN VALUE:"positive"='true' THEN 1
-            WHEN VALUE:"positive"='false' THEN 0
-            ELSE NULL
-            END AS USER_FEEDBACK,
-        VALUE:"feedback_message" AS USER_FEEDBACK_MESSAGE,
+    RECORD_ATTRIBUTES:"snow.ai.observability.agent.planning.tool_selection.type" AS TOOL_TYPE,
+    CASE 
+        WHEN RECORD_ATTRIBUTES:"snow.ai.observability.agent.tool.id" IS NOT NULL     
+        AND RECORD:"name" NOT IN ('SqlExecution', 'SqlExecution_CortexAnalyst','CortexChartToolImpl-data_to_chart')
+ 
+        THEN OBJECT_CONSTRUCT (
+            'tool_name',
+            TOOL_CALL,
+            'tool_output',
+            OBJECT_CONSTRUCT(
+            'SQL',
+            GENERATED_SQL,
+            'search results',
+            CORTEX_SEARCH_RESULT,
+            'CUSTOM_TOOL_RESULT',
+            CUSTOM_TOOL_RESULT
+            ))
+        ELSE NULL
+        END AS TOOL_ARRAY,
 
-        RECORD:"name" as OPERATION,
-        *
+    CASE
+        WHEN VALUE:"positive"='true' THEN 1
+        WHEN VALUE:"positive"='false'THEN 0
+        ELSE NULL
+        END AS USER_FEEDBACK,
+    VALUE:"feedback_message" AS USER_FEEDBACK_MESSAGE,
+    RECORD:"name" as OPERATION
+    
     FROM SNOWFLAKE.LOCAL.AI_OBSERVABILITY_EVENTS 
     WHERE SCOPE:name = 'snow.cortex.agent'
-    AND OPERATION != 'Agent'
-    AND THREAD_ID IS NOT NULL
+    AND OPERATION !='Agent'
     """
     
     # Add optional filters
@@ -109,24 +117,29 @@ WITH RESULTS AS (
     
     query += " ".join(filters)
     query += """
-    ORDER BY THREAD_ID, TIMESTAMP, START_TIMESTAMP ASC
-)
-SELECT 
-    THREAD_MESSAGE_ID,
-    MIN(TIMESTAMP) AS TS,
-    MIN(AGENT_NAME) AS AGENT_NAME,
-    ARRAY_AGG(INPUT_QUERY) WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS INPUT_QUERIES,
-    ARRAY_AGG(AGENT_RESPONSE) WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS AGENT_RESPONSE,
-    ARRAY_AGG(AGENT_PLANNING) WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS AGENT_PLANNING,
-    ARRAY_AGG(TOOL_SELECTION) WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS TOOL_CALLS,
-    ARRAY_AGG(COALESCE(GENERATED_SQL, SQL_RESULT, CORTEX_SEARCH_RESULT, CUSTOM_TOOL_RESULT))   
-    WITHIN GROUP (ORDER BY TIMESTAMP ASC) AS TOOL_RESULTS,
-    ARRAY_AGG(USER_FEEDBACK) AS USER_FEEDBACKS,
-    ARRAY_AGG(USER_FEEDBACK_MESSAGE) AS USER_FEEDBACK_MESSAGES
+    ORDER BY THREAD_ID, TS, START_TIMESTAMP ASC)
+
+    SELECT 
+        RECORD_ID,
+        MIN(TS) AS START_TS,
+        MAX(TS) AS END_TS,
+        DATEDIFF(SECOND, START_TS, END_TS)::FLOAT AS LATENCY, 
+        MIN(AGENT_NAME) AS AGENT_NAME,
+        MIN(INPUT_QUERY) AS INPUT_QUERY,
+        MIN(AGENT_RESPONSE) AS AGENT_RESPONSE,
+        MIN(AGENT_PLANNING) AS AGENT_PLANNING,
+        ARRAY_AGG(TOOL_SELECTION)  WITHIN GROUP (ORDER BY TS ASC) AS TOOL_CALLS,
+        ARRAY_AGG(CSS_NAME)   WITHIN GROUP (ORDER BY TS ASC) AS CSS_CALLS,
+        ARRAY_AGG(TOOL_TYPE)  WITHIN GROUP (ORDER BY TS ASC) AS TOOL_TYPES,
+        ARRAY_AGG(GENERATED_SQL)  WITHIN GROUP (ORDER BY TS ASC) AS GENERATED_SQLS,
+        ARRAY_AGG(CORTEX_SEARCH_RESULT)  WITHIN GROUP (ORDER BY TS ASC) AS CORTEX_SEARCH_RESULTS,
+        ARRAY_AGG(CUSTOM_TOOL_RESULT)  WITHIN GROUP (ORDER BY TS ASC) AS CUSTOM_TOOL_RESULTS,
+        ARRAY_AGG(TOOL_ARRAY) WITHIN GROUP (ORDER BY TS ASC) AS TOOL_ARRAY,
+        MIN(USER_FEEDBACK) AS USER_FEEDBACKS,
+        MIN(USER_FEEDBACK_MESSAGE) AS USER_FEEDBACK_MESSAGES
     
-FROM RESULTS
-GROUP BY THREAD_MESSAGE_ID
-"""
+        FROM RESULTS    
+        GROUP BY RECORD_ID"""
     feedback_filter = []
     if user_feedback == 'Positive Feedback Only':
         feedback_filter.append(f"HAVING USER_FEEDBACKS[0] = 1")
@@ -137,28 +150,45 @@ GROUP BY THREAD_MESSAGE_ID
     query += " ".join(feedback_filter)
     
     query += """
-    ORDER BY TS ASC
+    ORDER BY START_TS DESC;
+
     """
     
     return query
 
-def convert_tools_list_to_sequence_dict(tool_list):
-    """
-    Convert a list of tool names into a list of dictionaries with tool names and sequence numbers
+# def convert_tools_list_to_sequence_dict(tool_list):
+#     """
+#     Convert a list of tool names into a list of dictionaries with tool names and sequence numbers
     
-    Args:
-        tool_list (list): List of tool names
+#     Args:
+#         tool_list (list): List of tool names
         
-    Returns:
-        list: List of dictionaries containing tool_name and tool_sequence
-    """
-    return [
-        {
-            'tool_name': ast.literal_eval(tool)[0],
-            'tool_sequence': str(idx + 1)
-        }
-        for idx, tool in enumerate(tool_list)
+#     Returns:
+#         list: List of dictionaries containing tool_name and tool_sequence
+#     """
+#     return [
+#         {
+#             'tool_name': ast.literal_eval(tool)[0],
+#             'tool_sequence': str(idx + 1)
+#         }
+#         for idx, tool in enumerate(tool_list)
+#     ]
+
+def add_tool_sequence(tool_list):
+
+    for idx, tool in enumerate(tool_list):
+        tool.update({'tool_sequence': idx+1})
+        
+    new_order = ['tool_sequence', 'tool_name', 'tool_output']
+
+    # final_tool_list = {k: tool_list[k] for k in new_order if k in tool_list}
+
+     # return a new list where each dict's keys appear in new_order
+    final_tool_list = [
+        {k: tool[k] for k in new_order if k in tool}
+        for tool in tool_list
     ]
+    return final_tool_list
 
 def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
     """Execute query and return results as pandas DataFrame
@@ -172,12 +202,14 @@ def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
         #Pandas post processing section
 
         #Drop duplicate queries
-        df.drop_duplicates(subset=['AGENT_NAME', 'INPUT_QUERIES'], inplace=True)
+        df.drop_duplicates(subset=['AGENT_NAME', 'INPUT_QUERY'], inplace=True)
         
         #Create tool selection sequence
-        df['TOOL_SELECTION'] = df.TOOL_CALLS.apply(lambda x: json.dumps(convert_tools_list_to_sequence_dict(ast.literal_eval(x))))
-        
-        return df
+        df['TOOL_CALLING']  = df.TOOL_ARRAY.apply(lambda x: add_tool_sequence(ast.literal_eval(x)))        
+        final_df = df[['RECORD_ID', 'START_TS', 'AGENT_NAME',
+              'INPUT_QUERY', 'AGENT_RESPONSE', 'TOOL_CALLING', 
+               'LATENCY','USER_FEEDBACKS', 'USER_FEEDBACK_MESSAGES']]
+        return final_df
     except Exception as e:
         st.error(f"Query execution failed: {e}")
         raise
