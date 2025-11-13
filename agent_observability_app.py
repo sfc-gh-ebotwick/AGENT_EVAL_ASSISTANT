@@ -51,7 +51,7 @@ def get_snowflake_connection():
                 return None
     return st.session_state.connection
 
-def build_query(agent_name: Optional[str] = None, thread_id: Optional[str] = None, user_feedback: Optional[str] = None) -> str:
+def build_query(agent_name: Optional[str] = None, record_id: Optional[str] = None, user_feedback: Optional[str] = None) -> str:
     """Build the query with optional filters for AGENT_NAME and THREAD_ID"""
     
     # Base query
@@ -112,8 +112,8 @@ WITH RESULTS AS (SELECT
     filters = []
     if agent_name:
         filters.append(f"AND AGENT_NAME = '{agent_name}'")
-    if thread_id:
-        filters.append(f"AND THREAD_ID = '{thread_id}'")
+    if record_id:
+        filters.append(f"AND RECORD_ID = '{record_id}'")
     
     query += " ".join(filters)
     query += """
@@ -128,12 +128,6 @@ WITH RESULTS AS (SELECT
         MIN(INPUT_QUERY) AS INPUT_QUERY,
         MIN(AGENT_RESPONSE) AS AGENT_RESPONSE,
         MIN(AGENT_PLANNING) AS AGENT_PLANNING,
-        ARRAY_AGG(TOOL_SELECTION)  WITHIN GROUP (ORDER BY TS ASC) AS TOOL_CALLS,
-        ARRAY_AGG(CSS_NAME)   WITHIN GROUP (ORDER BY TS ASC) AS CSS_CALLS,
-        ARRAY_AGG(TOOL_TYPE)  WITHIN GROUP (ORDER BY TS ASC) AS TOOL_TYPES,
-        ARRAY_AGG(GENERATED_SQL)  WITHIN GROUP (ORDER BY TS ASC) AS GENERATED_SQLS,
-        ARRAY_AGG(CORTEX_SEARCH_RESULT)  WITHIN GROUP (ORDER BY TS ASC) AS CORTEX_SEARCH_RESULTS,
-        ARRAY_AGG(CUSTOM_TOOL_RESULT)  WITHIN GROUP (ORDER BY TS ASC) AS CUSTOM_TOOL_RESULTS,
         ARRAY_AGG(TOOL_ARRAY) WITHIN GROUP (ORDER BY TS ASC) AS TOOL_ARRAY,
         MIN(USER_FEEDBACK) AS USER_FEEDBACKS,
         MIN(USER_FEEDBACK_MESSAGE) AS USER_FEEDBACK_MESSAGES
@@ -142,11 +136,11 @@ WITH RESULTS AS (SELECT
         GROUP BY RECORD_ID"""
     feedback_filter = []
     if user_feedback == 'Positive Feedback Only':
-        feedback_filter.append(f"HAVING USER_FEEDBACKS[0] = 1")
+        feedback_filter.append(f" HAVING USER_FEEDBACKS = 1")
     elif user_feedback == 'Negative Feedback Only':
-        feedback_filter.append(f"HAVING USER_FEEDBACKS[0] = 0")
+        feedback_filter.append(f" HAVING USER_FEEDBACKS = 0")
     elif user_feedback == 'Any Feedback':
-        feedback_filter.append(f"HAVING USER_FEEDBACKS[0] IS NOT NULL")
+        feedback_filter.append(f" HAVING USER_FEEDBACKS IS NOT NULL")
     query += " ".join(feedback_filter)
     
     query += """
@@ -181,9 +175,7 @@ def add_tool_sequence(tool_list):
         
     new_order = ['tool_sequence', 'tool_name', 'tool_output']
 
-    # final_tool_list = {k: tool_list[k] for k in new_order if k in tool_list}
-
-     # return a new list where each dict's keys appear in new_order
+    # return a new list where each dict's keys appear in new_order
     final_tool_list = [
         {k: tool[k] for k in new_order if k in tool}
         for tool in tool_list
@@ -205,10 +197,13 @@ def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
         df.drop_duplicates(subset=['AGENT_NAME', 'INPUT_QUERY'], inplace=True)
         
         #Create tool selection sequence
-        df['TOOL_CALLING']  = df.TOOL_ARRAY.apply(lambda x: add_tool_sequence(ast.literal_eval(x)))        
+        df['TOOL_CALLING']  = df.TOOL_ARRAY.apply(lambda x: add_tool_sequence(ast.literal_eval(x)))
+
+        # df['TOOL_CALLING_READABLE'] = df.explode('TOOL_CALLING')
         final_df = df[['RECORD_ID', 'START_TS', 'AGENT_NAME',
               'INPUT_QUERY', 'AGENT_RESPONSE', 'TOOL_CALLING', 
                'LATENCY','USER_FEEDBACKS', 'USER_FEEDBACK_MESSAGES']]
+
         return final_df
     except Exception as e:
         st.error(f"Query execution failed: {e}")
@@ -273,7 +268,7 @@ with st.sidebar:
     # Filters
     st.header("Filters")
     agent_name = st.text_input("AGENT_NAME (optional)", value="")
-    thread_id = st.text_input("THREAD_ID (optional)", value="")
+    record_id = st.text_input("RECORD_ID (optional)", value="")
     user_feedback = st.selectbox(
                         "User Feedback:",
                         ("Positive Feedback Only", "Negative Feedback Only", "Any Feedback"),
@@ -304,7 +299,7 @@ if st.session_state.connection:
                     session = st.session_state.connection
                     query = build_query(
                         agent_name=agent_name.strip() if agent_name else None,
-                        thread_id=thread_id.strip() if thread_id else None,
+                        record_id=record_id.strip() if record_id else None,
                         user_feedback=user_feedback
                     )
                     
@@ -323,14 +318,14 @@ if st.session_state.connection:
             st.metric("Records Returned", len(df))
             
             # Display DataFrame
-            st.dataframe(df, use_container_width=True, height=400)
+            st.dataframe(session.create_dataframe(df), use_container_width=True, height=400)
             
             # Download as CSV
             csv = df.to_csv(index=False)
             st.download_button(
                 label="📥 Download CSV",
                 data=csv,
-                file_name=f"observability_events_{agent_name or 'all'}_{thread_id or 'all'}.csv",
+                file_name=f"observability_events_{agent_name or 'all'}_{record_id or 'all'}.csv",
                 mime="text/csv"
             )
             
@@ -370,7 +365,7 @@ if st.session_state.connection:
             with st.expander("📋 View Generated SQL Query"):
                 query = build_query(
                     agent_name=agent_name.strip() if agent_name else None,
-                    thread_id=thread_id.strip() if thread_id else None,
+                    record_id=record_id.strip() if record_id else None,
                     user_feedback=user_feedback
                 )
                 st.code(query, language="sql")
