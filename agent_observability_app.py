@@ -198,10 +198,11 @@ def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
         
         #Create tool selection sequence
         df['TOOL_CALLING']  = df.TOOL_ARRAY.apply(lambda x: add_tool_sequence(ast.literal_eval(x)))
+        df['EXPECTED_TOOLS'] = df.apply(lambda x: {'ground_truth_invocations': x.TOOL_CALLING, 'ground_truth_output': x.AGENT_RESPONSE} ,axis=1)
 
         # df['TOOL_CALLING_READABLE'] = df.explode('TOOL_CALLING')
         final_df = df[['RECORD_ID', 'START_TS', 'AGENT_NAME',
-              'INPUT_QUERY', 'AGENT_RESPONSE', 'TOOL_CALLING', 
+              'INPUT_QUERY', 'AGENT_RESPONSE', 'TOOL_CALLING','EXPECTED_TOOLS', 
                'LATENCY','USER_FEEDBACKS', 'USER_FEEDBACK_MESSAGES']]
 
         return final_df
