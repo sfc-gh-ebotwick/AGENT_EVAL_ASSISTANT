@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from typing import Optional
 import ast
 import json
+import re
 
 # Load environment variables
 load_dotenv()
@@ -55,7 +56,7 @@ def build_query(agent_name: Optional[str] = None, record_id: Optional[str] = Non
     """Build the query with optional filters for AGENT_NAME and THREAD_ID"""
     
     # Base query
-    query = """
+    query = f"""
 WITH RESULTS AS (SELECT 
     TIMESTAMP AS TS,
     RECORD_ATTRIBUTES:"snow.ai.observability.object.name" AS AGENT_NAME,
@@ -83,6 +84,8 @@ WITH RESULTS AS (SELECT
         THEN OBJECT_CONSTRUCT (
             'tool_name',
             TOOL_CALL,
+            'tool_type',
+            TOOL_TYPE,
             'tool_output',
             OBJECT_CONSTRUCT(
             'SQL',
@@ -103,20 +106,19 @@ WITH RESULTS AS (SELECT
     VALUE:"feedback_message" AS USER_FEEDBACK_MESSAGE,
     RECORD:"name" as OPERATION
     
-    FROM SNOWFLAKE.LOCAL.AI_OBSERVABILITY_EVENTS 
-    WHERE SCOPE:name = 'snow.cortex.agent'
-    AND OPERATION !='Agent'
-    """
+    FROM TABLE(SNOWFLAKE.LOCAL.GET_AI_OBSERVABILITY_EVENTS(
+    'SNOWFLAKE_INTELLIGENCE', 
+    'AGENTS', 
+    'FINANCE_AGENT', 
+    'CORTEX AGENT'))"""
     
     # Add optional filters
     filters = []
-    if agent_name:
-        filters.append(f"AND AGENT_NAME = '{agent_name}'")
     if record_id:
         filters.append(f"AND RECORD_ID = '{record_id}'")
     
     query += " ".join(filters)
-    query += """
+    query += f"""
     ORDER BY THREAD_ID, TS, START_TIMESTAMP ASC)
 
     SELECT 
@@ -168,18 +170,59 @@ WITH RESULTS AS (SELECT
 #         for idx, tool in enumerate(tool_list)
 #     ]
 
-def add_tool_sequence(tool_list):
+# def add_tool_sequence(tool_list):
 
-    for idx, tool in enumerate(tool_list):
-        tool.update({'tool_sequence': idx+1})
+#     for idx, tool in enumerate(tool_list):
+#         tool.update({'tool_sequence': idx+1})
         
-    new_order = ['tool_sequence', 'tool_name', 'tool_output']
+#     new_order = ['tool_sequence', 'tool_name', 'tool_output']
 
-    # return a new list where each dict's keys appear in new_order
-    final_tool_list = [
-        {k: tool[k] for k in new_order if k in tool}
+#     # return a new list where each dict's keys appear in new_order
+#     final_tool_list = [
+#         {k: tool[k] for k in new_order if k in tool}
+#         for tool in tool_list
+#     ]
+#     return final_tool_list
+
+
+def add_tool_sequence(tool_list):
+    new_order = ['tool_sequence', 'tool_name', 'tool_output']
+    drop_list = ['SqlExecution', 'SqlExecution_CortexAnalyst', 'CortexChartToolImpl-data_to_chart']
+
+    # 1. Remove unwanted tools
+    filtered_tools = [
+        tool
         for tool in tool_list
+        if tool.get('tool_name') not in drop_list
     ]
+
+    # 2. Add sequence and reorder keys
+    updated_tools = []
+    for idx, tool in enumerate(filtered_tools):
+        tool_name = tool['tool_name']
+        if tool_name.startswith('CortexAnalystTool_'):
+            tool_name = tool_name.replace('CortexAnalystTool_', '', 1)
+
+        elif tool_name.startswith('CortexSearchService_'):
+            tool_name = 'cortex_search'
+
+        elif tool_name.startswith('ToolCall-'):
+            tool_name = tool_name.replace('ToolCall-', '', 1)
+
+        updated_tool = {
+            **tool,
+            "tool_sequence": idx + 1,
+            "tool_name": tool_name
+        }
+
+
+        # Reorder output keys
+        reordered_tool = {k: updated_tool[k] for k in new_order if k in updated_tool}
+
+        updated_tools.append(reordered_tool)
+
+    # 3. Define return var and return it
+    final_tool_list = updated_tools
     return final_tool_list
 
 def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
@@ -187,11 +230,63 @@ def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
         Perform some operations in pandas to clean up data."""
     try:
         data = session.sql(query)
-        
-        # Convert to DataFrame
-        df = data.to_pandas()
 
+        df = data.to_pandas()
         #Pandas post processing section
+
+        def clean_text(s):
+            """
+            Normalize a text cell:
+            - If it looks like a Python/JSON quoted literal, try ast.literal_eval to unescape safely.
+            - Otherwise try a unicode_escape decode as a fallback.
+            - Remove matching surrounding quotes (single or double), repeating a few times to handle nested quoting.
+            - Remove any leftover backslashes, collapse whitespace, strip.
+            """
+            if pd.isna(s):
+                return s
+        
+            s = str(s).strip()
+        
+            # Try to safely unescape if it looks like a quoted literal.
+            # Using ast.literal_eval is safest when strings are like: '"abc"', "'abc'", r'\"abc\"'
+            try:
+                # Only try literal_eval for strings that start with a quote or an escape-quote (cheap heuristic)
+                if s.startswith('"') or s.startswith("'") or s.startswith(r'\"') or s.startswith(r"\'"):
+                    s_eval = ast.literal_eval(s)
+                    # If literal_eval returns a non-str (rare), convert to str
+                    s = s_eval if isinstance(s_eval, str) else str(s_eval)
+                else:
+                    # fallback: unescape typical escape sequences like \n, \t, \" etc.
+                    # This will turn r'\"abc\"' -> '"abc"'
+                    try:
+                        s = bytes(s, "utf-8").decode("unicode_escape")
+                    except Exception:
+                        pass
+            except Exception:
+                # If literal_eval fails, try unicode escaping fallback, but don't raise.
+                try:
+                    s = bytes(s, "utf-8").decode("unicode_escape")
+                except Exception:
+                    pass
+        
+            # Remove matching surrounding quotes repeatedly (handles nested quoting)
+            for _ in range(3):  # loop a few times in case of multiple nested levels
+                if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+                    s = s[1:-1]
+                else:
+                    break
+        
+            # Remove leftover backslashes that are likely artifacts
+            s = s.replace('\\', '')
+        
+            # Collapse whitespace and trim
+            s = re.sub(r'\s+', ' ', s).strip()
+        
+            return s
+
+        df['INPUT_QUERY'] = df['INPUT_QUERY'].apply(lambda x: clean_text(x))
+        df['AGENT_RESPONSE'] = df['AGENT_RESPONSE'].apply(lambda x: clean_text(x))
+
 
         #Drop duplicate queries
         df.drop_duplicates(subset=['AGENT_NAME', 'INPUT_QUERY'], inplace=True)
@@ -216,6 +311,7 @@ def write_to_table(session, df: pd.DataFrame, table_name: str, database: Optiona
     try:
         # Parse table name (could be DATABASE.SCHEMA.TABLE or TABLE)
         target_table = table_name.upper()
+
         
         # Handle both Snowpark Session and connector connection
         if hasattr(session, 'write_pandas'):
@@ -268,7 +364,10 @@ with st.sidebar:
     
     # Filters
     st.header("Filters")
-    agent_name = st.text_input("AGENT_NAME (optional)", value="")
+    
+    agent_name = st.selectbox("Select Your Agent Name", 
+                              session.sql('SHOW AGENTS IN ACCOUNT').to_pandas()['"name"'].values,
+                              key="AGENT_NAME")
     record_id = st.text_input("RECORD_ID (optional)", value="")
     user_feedback = st.selectbox(
                         "User Feedback:",
@@ -306,6 +405,7 @@ if st.session_state.connection:
                     
                     try:
                         df = execute_query_and_postprocess(session, query)
+
                         st.session_state.query_results = df
                         st.session_state.query_executed = True
                         st.rerun()
@@ -315,11 +415,11 @@ if st.session_state.connection:
         # Display results
         if 'query_executed' in st.session_state and st.session_state.query_executed:
             df = st.session_state.query_results
-            
+
             st.metric("Records Returned", len(df))
             
             # Display DataFrame
-            st.dataframe(session.create_dataframe(df), use_container_width=True, height=400)
+            st.dataframe(df, use_container_width=True, height=400)
             
             # Download as CSV
             csv = df.to_csv(index=False)
@@ -400,7 +500,7 @@ if st.session_state.connection:
         if st.button("🔄 Load Data", type="primary"):
             if data_source == "Load from Query Results":
                 if 'query_executed' in st.session_state and st.session_state.query_executed:
-                    st.session_state.editing_df = st.session_state.query_results.copy()
+                    st.session_state.editing_df = df.copy()
                     st.success(f"✅ Loaded {len(st.session_state.editing_df)} rows from query results")
                     st.rerun()
                 else:
@@ -409,10 +509,10 @@ if st.session_state.connection:
                 # Load from table
                 if load_table_name.strip():
                     with st.spinner("Loading data from table..."):
-                        df = load_from_table(session, load_table_name.strip())
-                        if not df.empty:
-                            st.session_state.editing_df = df
-                            st.success(f"✅ Loaded {len(df)} rows from {load_table_name}")
+                        data = load_from_table(session, load_table_name.strip())
+                        if not data.empty:
+                            st.session_state.editing_df = data
+                            st.success(f"✅ Loaded {len(data)} rows from {load_table_name}")
                             st.rerun()
                         else:
                             st.error("❌ No data loaded. Please check the table name.")
@@ -424,7 +524,7 @@ if st.session_state.connection:
         # Display editable dataframe
         if st.session_state.editing_df is not None:
             df = st.session_state.editing_df
-            
+
             st.metric("Records in Dataset", len(df))
             
             # Add new row button
@@ -482,7 +582,17 @@ if st.session_state.connection:
                 if st.button("💾 Save Changes", type="primary"):
                     if save_table_name.strip():
                         with st.spinner("Saving changes to table..."):
-                            success = write_to_table(session, edited_df, save_table_name.strip(), overwrite=save_overwrite)
+                            # edited_df['EXPECTED_TOOLS'] = edited_df.EXPECTED_TOOLS.apply(lambda x: json.loads(x))
+                            write_df = edited_df[['INPUT_QUERY', 'EXPECTED_TOOLS']]
+                            session.sql(f"CREATE OR REPLACE TABLE {save_table_name.strip()} (INPUT_QUERY VARCHAR,EXPECTED_TOOLS VARIANT);")
+                            success = write_to_table(session, write_df, save_table_name.strip(), overwrite=save_overwrite)
+                            # session.sql(f'UPDATE {save_table_name.strip()} SET EXPECTED_TOOLS = PARSE_JSON(EXPECTED_TOOLS)')
+                            
+                            # session.sql(f"""CREATE OR REPLACE TABLE {save_table_name.strip()} 
+                            #                 AS SELECT INPUT_QUERY, PARSE_JSON(EXPECTED_TOOLS) AS EXPECTED_TOOLS
+                            #                 FROM {save_table_name.strip()} ;""")
+
+                            
                             if success:
                                 st.success(f"✅ Successfully saved {len(edited_df)} rows to {save_table_name}")
                                 st.session_state.editing_df = edited_df.copy()
