@@ -52,7 +52,7 @@ def get_snowflake_connection():
                 return None
     return st.session_state.connection
 
-def build_query(agent_name: Optional[str] = None, record_id: Optional[str] = None, user_feedback: Optional[str] = None) -> str:
+def build_query(record_id: Optional[str] = None, user_feedback: Optional[str] = None) -> str:
     """Build the query with optional filters for AGENT_NAME and THREAD_ID"""
     
     # Base query
@@ -109,7 +109,7 @@ WITH RESULTS AS (SELECT
     FROM TABLE(SNOWFLAKE.LOCAL.GET_AI_OBSERVABILITY_EVENTS(
     'SNOWFLAKE_INTELLIGENCE', 
     'AGENTS', 
-    'FINANCE_AGENT', 
+    '{agent_name}', 
     'CORTEX AGENT'))"""
     
     # Add optional filters
@@ -364,9 +364,8 @@ with st.sidebar:
     
     # Filters
     st.header("Filters")
-    
     agent_name = st.selectbox("Select Your Agent Name", 
-                              session.sql('SHOW AGENTS IN ACCOUNT').to_pandas()['"name"'].values,
+                              sorted(session.sql('SHOW AGENTS IN ACCOUNT').to_pandas()['"name"'].values),
                               key="AGENT_NAME")
     record_id = st.text_input("RECORD_ID (optional)", value="")
     user_feedback = st.selectbox(
@@ -398,7 +397,6 @@ if st.session_state.connection:
                 with st.spinner("Executing query..."):
                     session = st.session_state.connection
                     query = build_query(
-                        agent_name=agent_name.strip() if agent_name else None,
                         record_id=record_id.strip() if record_id else None,
                         user_feedback=user_feedback
                     )
@@ -465,7 +463,6 @@ if st.session_state.connection:
             # Show query for reference
             with st.expander("📋 View Generated SQL Query"):
                 query = build_query(
-                    agent_name=agent_name.strip() if agent_name else None,
                     record_id=record_id.strip() if record_id else None,
                     user_feedback=user_feedback
                 )
