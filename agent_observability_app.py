@@ -1,62 +1,61 @@
 import streamlit as st
 import pandas as pd
-import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
 from snowflake.snowpark import Session
 import os
 from dotenv import load_dotenv
-from typing import Optional
+from typing import Optional, Dict, List, Any
 import ast
 import json
 import re
+import traceback
+from datetime import datetime
 
-# Load environment variables
 load_dotenv()
 
-# Page config
-st.set_page_config(
-    page_title="AI Observability Events Query",
-    page_icon="🔍",
-    layout="wide"
-)
+if 'dataset' not in st.session_state:
+    st.session_state.dataset = None
+if 'workflow_step' not in st.session_state:
+    st.session_state.workflow_step = 1
+if 'query_executed' not in st.session_state:
+    st.session_state.query_executed = False
 
-# Initialize session state
-if 'connection' not in st.session_state:
-    st.session_state.connection = None
-
+@st.cache_resource
 def get_snowflake_connection():
-    """Get or create Snowflake connection"""
-    if st.session_state.connection is None:
+    """Get or create Snowflake connection (cached)"""
+    try:
+        session = Session.get_active_sessioan()
+        return session
+    except Exception:
         try:
-            session = Session.get_active_session()
-            st.session_state.connection = session
-            # st.success("✅ Connected to Snowflake via get_active_session()")
+            connection_parameters = {
+                "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+                "user": os.getenv("SNOWFLAKE_USER"),
+                "password": os.getenv("SNOWFLAKE_PASSWORD"),
+                "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
+                "database": os.getenv("SNOWFLAKE_DATABASE", "SNOWFLAKE"),
+                "schema": os.getenv("SNOWFLAKE_SCHEMA", "LOCAL"),
+                "role": os.getenv("SNOWFLAKE_ROLE", "ACCOUNTADMIN")
+            }
+            return Session.builder.configs(connection_parameters).create()
         except Exception as e:
-            try: 
-                # Create Snowpark Session using connection parameters
-                connection_parameters = {
-                    "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-                    "user": os.getenv("SNOWFLAKE_USER"),
-                    "password": os.getenv("SNOWFLAKE_PASSWORD"),
-                    "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-                    "database": os.getenv("SNOWFLAKE_DATABASE", "SNOWFLAKE"),
-                    "schema": os.getenv("SNOWFLAKE_SCHEMA", "LOCAL"),
-                    "role": os.getenv("SNOWFLAKE_ROLE", "ACCOUNTADMIN")
-                }
-                
-                st.session_state.connection = Session.builder.configs(connection_parameters).create()
-                
-                # st.success("✅ Connected to Snowflake")
-            except Exception as connection_failed:
-                st.error(f"❌ Connection failed: {connection_failed}")
-                return None
-    return st.session_state.connection
+            st.error(f"❌ Connection failed: {e}")
+            return None
 
-def build_query(record_id: Optional[str] = None, user_feedback: Optional[str] = None) -> str:
+@st.cache_data(ttl=300)
+def get_agent_list(_session) -> List[str]:
+    """Get list of agents (cached for 5 minutes)"""
+    try:
+        agents_df = _session.sql('SHOW AGENTS IN ACCOUNT').to_pandas()
+        return sorted(agents_df['"name"'].values.tolist())
+    except Exception as e:
+        st.error(f"Failed to load agents: {e}")
+        return []
+
+def build_query(agent_name: str, record_id: Optional[str] = None, user_feedback: Optional[str] = None) -> str:
     """Build the query with optional filters for AGENT_NAME and THREAD_ID"""
     
-    # Base query
-    query = f"""
+    base_query = f"""
 WITH RESULTS AS (SELECT 
     TIMESTAMP AS TS,
     RECORD_ATTRIBUTES:"snow.ai.observability.object.name" AS AGENT_NAME,
@@ -112,13 +111,12 @@ WITH RESULTS AS (SELECT
     '{agent_name}', 
     'CORTEX AGENT'))"""
     
-    # Add optional filters
     filters = []
     if record_id:
         filters.append(f"AND RECORD_ID = '{record_id}'")
     
-    query += " ".join(filters)
-    query += f"""
+    query = base_query + " " + " ".join(filters)
+    query += """
     ORDER BY THREAD_ID, TS, START_TIMESTAMP ASC)
 
     SELECT 
@@ -136,56 +134,18 @@ WITH RESULTS AS (SELECT
     
         FROM RESULTS    
         GROUP BY RECORD_ID"""
-    feedback_filter = []
+    
     if user_feedback == 'Positive Feedback Only':
-        feedback_filter.append(f" HAVING USER_FEEDBACKS = 1")
+        query += " HAVING USER_FEEDBACKS = 1"
     elif user_feedback == 'Negative Feedback Only':
-        feedback_filter.append(f" HAVING USER_FEEDBACKS = 0")
+        query += " HAVING USER_FEEDBACKS = 0"
     elif user_feedback == 'Any Feedback':
-        feedback_filter.append(f" HAVING USER_FEEDBACKS IS NOT NULL")
-    query += " ".join(feedback_filter)
+        query += " HAVING USER_FEEDBACKS IS NOT NULL"
     
-    query += """
-    ORDER BY START_TS DESC;
-
-    """
-    
+    query += " ORDER BY START_TS DESC;"
     return query
 
-# def convert_tools_list_to_sequence_dict(tool_list):
-#     """
-#     Convert a list of tool names into a list of dictionaries with tool names and sequence numbers
-    
-#     Args:
-#         tool_list (list): List of tool names
-        
-#     Returns:
-#         list: List of dictionaries containing tool_name and tool_sequence
-#     """
-#     return [
-#         {
-#             'tool_name': ast.literal_eval(tool)[0],
-#             'tool_sequence': str(idx + 1)
-#         }
-#         for idx, tool in enumerate(tool_list)
-#     ]
-
-# def add_tool_sequence(tool_list):
-
-#     for idx, tool in enumerate(tool_list):
-#         tool.update({'tool_sequence': idx+1})
-        
-#     new_order = ['tool_sequence', 'tool_name', 'tool_output']
-
-#     # return a new list where each dict's keys appear in new_order
-#     final_tool_list = [
-#         {k: tool[k] for k in new_order if k in tool}
-#         for tool in tool_list
-#     ]
-#     return final_tool_list
-
-
-def add_tool_sequence(tool_list):
+def add_tool_sequence(tool_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     new_order = ['tool_sequence', 'tool_name', 'tool_output']
     drop_list = ['SqlExecution', 'SqlExecution_CortexAnalyst', 'CortexChartToolImpl-data_to_chart']
 
@@ -225,14 +185,13 @@ def add_tool_sequence(tool_list):
     final_tool_list = updated_tools
     return final_tool_list
 
-def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
-    """Execute query and return results as pandas DataFrame
+@st.cache_data(ttl=600)
+def execute_query_and_postprocess(_session, query: str) -> pd.DataFrame:
+    """Execute query and return results as pandas DataFrame (cached for 10 minutes)
         Perform some operations in pandas to clean up data."""
     try:
-        data = session.sql(query)
-
+        data = _session.sql(query)
         df = data.to_pandas()
-        #Pandas post processing section
 
         def clean_text(s):
             """
@@ -284,18 +243,16 @@ def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
         
             return s
 
-        df['INPUT_QUERY'] = df['INPUT_QUERY'].apply(lambda x: clean_text(x))
-        df['AGENT_RESPONSE'] = df['AGENT_RESPONSE'].apply(lambda x: clean_text(x))
-
-
-        #Drop duplicate queries
+        df['INPUT_QUERY'] = df['INPUT_QUERY'].apply(clean_text)
+        df['AGENT_RESPONSE'] = df['AGENT_RESPONSE'].apply(clean_text)
         df.drop_duplicates(subset=['AGENT_NAME', 'INPUT_QUERY'], inplace=True)
         
         #Create tool selection sequence
-        df['TOOL_CALLING']  = df.TOOL_ARRAY.apply(lambda x: add_tool_sequence(ast.literal_eval(x)))
-        df['EXPECTED_TOOLS'] = df.apply(lambda x: {'ground_truth_invocations': x.TOOL_CALLING, 'ground_truth_output': x.AGENT_RESPONSE} ,axis=1)
-
-        # df['TOOL_CALLING_READABLE'] = df.explode('TOOL_CALLING')
+        df['TOOL_CALLING'] = df['TOOL_ARRAY'].apply(lambda x: add_tool_sequence(ast.literal_eval(x)))
+        df['EXPECTED_TOOLS'] = df.apply(lambda x: {
+            'ground_truth_invocations': x['TOOL_CALLING'], 
+            'ground_truth_output': x['AGENT_RESPONSE']
+        }, axis=1)
         final_df = df[['RECORD_ID', 'START_TS', 'AGENT_NAME',
               'INPUT_QUERY', 'AGENT_RESPONSE', 'TOOL_CALLING','EXPECTED_TOOLS', 
                'LATENCY','USER_FEEDBACKS', 'USER_FEEDBACK_MESSAGES']]
@@ -305,23 +262,31 @@ def execute_query_and_postprocess(session, query: str) -> pd.DataFrame:
         st.error(f"Query execution failed: {e}")
         raise
 
-def write_to_table(session, df: pd.DataFrame, table_name: str, database: Optional[str] = None, 
-                   schema: Optional[str] = None, overwrite: bool = False) -> bool:
+def validate_table_name(table_name: str) -> bool:
+    """Validate table name format"""
+    parts = table_name.strip().split('.')
+    return len(parts) == 3 and all(part.strip() for part in parts)
+
+def write_to_table(session, df: pd.DataFrame, table_name: str, overwrite: bool = False) -> bool:
     """Write DataFrame to Snowflake table"""
     try:
-        # Parse table name (could be DATABASE.SCHEMA.TABLE or TABLE)
         target_table = table_name.upper()
-
         
-        # Handle both Snowpark Session and connector connection
-        if hasattr(session, 'write_pandas'):
-            # Snowpark Session
-            success = session.write_pandas(df, target_table, auto_create_table=True, overwrite=overwrite)
-        else:
-            # Connector connection - use write_pandas from snowflake.connector.pandas_tools
-            success = write_pandas(session, df, target_table, auto_create_table=True, overwrite=overwrite)
+        # Convert EXPECTED_TOOLS to JSON strings for proper VARIANT handling
+        df_copy = df.copy()
+        if 'EXPECTED_TOOLS' in df_copy.columns:
+            df_copy['EXPECTED_TOOLS'] = df_copy['EXPECTED_TOOLS'].apply(lambda x: json.dumps(x) if pd.notna(x) else None)
         
-        return success
+        # Use write_pandas without auto_create since we're managing schema ourselves
+        success, nchunks, nrows, _ = session.write_pandas(
+            df_copy, 
+            target_table, 
+            auto_create_table=False,
+            overwrite=overwrite,
+            quote_identifiers=False
+        )
+        
+        return success and nrows > 0
     except Exception as e:
         st.error(f"Failed to write to table: {e}")
         return False
@@ -329,291 +294,480 @@ def write_to_table(session, df: pd.DataFrame, table_name: str, database: Optiona
 def load_from_table(session, table_name: str) -> pd.DataFrame:
     """Load data from Snowflake table"""
     try:
-        # Parse table name (could be DATABASE.SCHEMA.TABLE or TABLE)
         target_table = table_name.upper()
-        
         query = f"SELECT * FROM {target_table}"
-        
-        # Handle both Snowpark Session and connector connection
-        if hasattr(session, 'sql'):
-            # Snowpark Session
-            data = session.sql(query)
-            df = data.to_pandas()
-        else:
-            # Connector connection
-            df = pd.read_sql(query, session)
-        
-        return df
+        data = session.sql(query)
+        return data.to_pandas()
     except Exception as e:
         st.error(f"Failed to load from table: {e}")
         return pd.DataFrame()
 
-# Main UI
-st.title("🔍 AI Observability Events Query Tool")
-st.markdown("Query and analyze AI observability events from Snowflake")
+def create_manual_record(input_query: str, agent_response: str, tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Create a manual evaluation record in the expected format"""
+    return {
+        'INPUT_QUERY': input_query.strip(),
+        'EXPECTED_TOOLS': {
+            'ground_truth_invocations': tools,
+            'ground_truth_output': agent_response.strip()
+        }
+    }
 
-# Sidebar for connection and filters
+st.title("🔍 AI evaluation dataset builder")
+st.caption("Build evaluation datasets from agent logs and manual entries")
+
+session = get_snowflake_connection()
+
 with st.sidebar:
     st.header("Configuration")
-    session = get_snowflake_connection()
     
-    if st.session_state.connection:
+    if session:
         st.success("✅ Connected")
+        try:
+            user_info = session.sql("SELECT CURRENT_USER(), CURRENT_ROLE(), CURRENT_WAREHOUSE()").collect()[0]
+            st.caption(f"User: {user_info[0]} | Role: {user_info[1]}")
+        except:
+            pass
+    else:
+        st.error("❌ Not connected")
     
     st.divider()
     
-    # Filters
-    st.header("Filters")
-    agent_name = st.selectbox("Select Your Agent Name", 
-                              sorted(session.sql('SHOW AGENTS IN ACCOUNT').to_pandas()['"name"'].values),
-                              key="AGENT_NAME")
-    record_id = st.text_input("RECORD_ID (optional)", value="")
-    user_feedback = st.selectbox(
-                        "User Feedback:",
-                        ("Positive Feedback Only", "Negative Feedback Only", "Any Feedback"),
-                        index=None,
-                        placeholder= "Select Option")
+    if st.session_state.dataset is not None:
+        st.metric("Records in dataset", len(st.session_state.dataset))
+    else:
+        st.caption("No dataset loaded yet")
     
-    st.markdown("**Note:** Leave filters empty to see all results")
-
-# Main content area
-if st.session_state.connection:
-    # Initialize session state for editing
-    if 'editing_df' not in st.session_state:
-        st.session_state.editing_df = None
+    st.divider()
     
-    # Create tabs
-    tab1, tab2 = st.tabs(["📊 Query & View", "✏️ Edit Dataset"])
+    if st.button("🔄 Reset dataset", help="Clear dataset and start over"):
+        st.session_state.dataset = None
+        st.session_state.query_executed = False
+        st.rerun()
+if session:
+    tabs = st.tabs(["📥 1. Load logs", "➕ 2. Add records", "✏️ 3. Review & edit", "📤 4. Export"])
     
-    with tab1:
-        # Query section
-        col1, col2 = st.columns([3, 1])
+    with tabs[0]:
+        st.header("Load existing logs")
+        st.caption("Start with agent observability logs to build your evaluation dataset")
         
+        col1, col2 = st.columns([2, 1])
         with col1:
-            st.subheader("Query Results")
+            agent_list = get_agent_list(session)
+            if agent_list:
+                agent_name = st.selectbox("Select your agent name", agent_list, key="agent_select")
+            else:
+                agent_name = st.text_input("Agent name", key="agent_input")
         
         with col2:
-            if st.button("🔄 Run Query", type="primary"):
-                with st.spinner("Executing query..."):
-                    session = st.session_state.connection
+            record_id = st.text_input("Record ID (optional)", value="", key="record_id_input")
+        
+        user_feedback = st.selectbox(
+            "Filter by user feedback",
+            [None, "Positive Feedback Only", "Negative Feedback Only", "Any Feedback"],
+            index=0,
+            key="feedback_filter"
+        )
+        
+        if st.button("📥 Load from agent logs", type="primary", disabled=not agent_name):
+            with st.spinner("Querying agent logs..."):
+                try:
                     query = build_query(
+                        agent_name=agent_name,
                         record_id=record_id.strip() if record_id else None,
                         user_feedback=user_feedback
                     )
+                    df = execute_query_and_postprocess(session, query)
                     
-                    try:
-                        df = execute_query_and_postprocess(session, query)
-
-                        st.session_state.query_results = df
-                        st.session_state.query_executed = True
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-        
-        # Display results
-        if 'query_executed' in st.session_state and st.session_state.query_executed:
-            df = st.session_state.query_results
-
-            st.metric("Records Returned", len(df))
-            
-            # Display DataFrame
-            st.dataframe(df, use_container_width=True, height=400)
-            
-            # Download as CSV
-            csv = df.to_csv(index=False)
-            st.download_button(
-                label="📥 Download CSV",
-                data=csv,
-                file_name=f"observability_events_{agent_name or 'all'}_{record_id or 'all'}.csv",
-                mime="text/csv"
-            )
-            
-            st.divider()
-            
-            # Write to table section
-            st.subheader("💾 Write Results to Snowflake Table")
-            
-            col1, col2, col3 = st.columns([3, 1, 1])
-            
-            with col1:
-                table_name = st.text_input(
-                    "Table Name (Use DATABASE.SCHEMA.TABLE_NAME format",
-                    value=f"AGENT_EVAL_DB.{agent_name or 'EVAL_SETS'}.EVAL_DATASET_v0",
-                    placeholder=f"AGENT_EVAL_DB.{agent_name or 'EVAL_SETS'}.EVAL_DATASET_v0",
-                    help="Enter full path (DATABASE.SCHEMA.TABLE)",
-                    key="query_table_name"
-                )
-            
-            with col2:
-                overwrite = st.checkbox("Overwrite table", value=False, help="If checked, will drop and recreate the table", key="query_overwrite")
-            
-            st.write("")  # Spacing
-            st.write("")  # Spacing
-            if st.button("📤 Write to Table", type="primary", key="query_write_button"):
-                if table_name.strip():
-                    with st.spinner("Writing data to table..."):
-                        success = write_to_table(session, df, table_name.strip(), overwrite=overwrite)
-                        if success:
-                            st.success(f"✅ Successfully wrote {len(df)} rows to {table_name}")
-                        else:
-                            st.error("❌ Failed to write data to table")
-                else:
-                    st.warning("⚠️ Please enter a table name")
-            
-            # Show query for reference
-            with st.expander("📋 View Generated SQL Query"):
-                query = build_query(
-                    record_id=record_id.strip() if record_id else None,
-                    user_feedback=user_feedback
-                )
-                st.code(query, language="sql")
-    
-    with tab2:
-        st.subheader("✏️ Edit Dataset")
-        st.markdown("Load a dataset from query results or a Snowflake table, then edit and save your changes.")
-        
-        session = st.session_state.connection
-        
-        # Data source selection
-        data_source = st.radio(
-            "Data Source:",
-            ["Load from Query Results", "Load from Snowflake Table"],
-            horizontal=True,
-            help="Choose to edit query results or load from an existing table"
-        )
-        
-        # Table name input for loading (show before button for better UX)
-        load_table_name = ""
-        if data_source == "Load from Snowflake Table":
-            load_table_name = st.text_input(
-                "Table Name (Use DATABASE.SCHEMA.TABLE_NAME format)",
-                value="",
-                placeholder="AGENT_EVAL_DB.SCHEMA.EVAL_DATASET_v0",
-                help="Enter full path (DATABASE.SCHEMA.TABLE)",
-                key="load_table_name"
-            )
-        
-        # Load button
-        if st.button("🔄 Load Data", type="primary"):
-            if data_source == "Load from Query Results":
-                if 'query_executed' in st.session_state and st.session_state.query_executed:
-                    st.session_state.editing_df = df.copy()
-                    st.success(f"✅ Loaded {len(st.session_state.editing_df)} rows from query results")
+                    if st.session_state.dataset is None or len(st.session_state.dataset) == 0:
+                        st.session_state.dataset = df[['INPUT_QUERY', 'EXPECTED_TOOLS']].copy()
+                    else:
+                        new_records = df[['INPUT_QUERY', 'EXPECTED_TOOLS']].copy()
+                        st.session_state.dataset = pd.concat([st.session_state.dataset, new_records], ignore_index=True)
+                    
+                    st.toast(f"✅ Loaded {len(df)} records from logs", icon="✅")
                     st.rerun()
-                else:
-                    st.warning("⚠️ Please run a query first in the 'Query & View' tab")
-            else:
-                # Load from table
-                if load_table_name.strip():
-                    with st.spinner("Loading data from table..."):
-                        data = load_from_table(session, load_table_name.strip())
-                        if not data.empty:
-                            st.session_state.editing_df = data
-                            st.success(f"✅ Loaded {len(data)} rows from {load_table_name}")
-                            st.rerun()
-                        else:
-                            st.error("❌ No data loaded. Please check the table name.")
-                else:
-                    st.warning("⚠️ Please enter a table name")
+                except Exception as e:
+                    st.error(f"Error loading logs: {e}")
         
         st.divider()
         
-        # Display editable dataframe
-        if st.session_state.editing_df is not None:
-            df = st.session_state.editing_df
-
-            st.metric("Records in Dataset", len(df))
+        if st.session_state.dataset is not None and len(st.session_state.dataset) > 0:
+            st.success(f"✅ Current dataset has {len(st.session_state.dataset)} records")
+            st.caption("Dataset preview (showing all records):")
+            st.dataframe(st.session_state.dataset, use_container_width=True, hide_index=True, height=400)
+        else:
+            st.info("No records loaded yet. Load logs above or go to 'Add records' tab.")
+    
+    with tabs[1]:
+        st.header("Add evaluation records")
+        st.caption("Manually create evaluation records using the form below")
+        
+        if st.session_state.dataset is not None and len(st.session_state.dataset) > 0:
+            st.success(f"✅ Current dataset: {len(st.session_state.dataset)} records")
+        
+        with st.form("add_record_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
             
-            # Add new row button
-            if st.button("➕ Add New Row", type="secondary"):
-                # Create a new row with None/NaN values based on column dtypes
-                new_row_dict = {}
-                for col in df.columns:
-                    if df[col].dtype == 'object':
-                        new_row_dict[col] = None
-                    elif pd.api.types.is_numeric_dtype(df[col]):
-                        new_row_dict[col] = pd.NA
+            with col1:
+                input_query = st.text_area(
+                    "Input query",
+                    placeholder="Enter the test query for your agent...",
+                    height=150,
+                    key="add_input_query"
+                )
+            
+            with col2:
+                agent_response = st.text_area(
+                    "Expected agent response",
+                    placeholder="Enter the expected response from the agent...",
+                    height=150,
+                    key="add_agent_response"
+                )
+            
+            st.divider()
+            st.markdown("**Tool invocations**")
+            st.caption("Define the expected sequence of tool calls")
+            
+            num_tools = st.number_input("Number of tools", min_value=0, max_value=10, value=1, step=1, key="add_num_tools")
+            
+            tools = []
+            for i in range(int(num_tools)):
+                st.markdown(f"**Tool {i+1}**")
+                col1, col2 = st.columns([2, 3])
+                
+                with col1:
+                    tool_name = st.text_input(
+                        "Tool name",
+                        key=f"add_tool_name_{i}",
+                        placeholder="e.g., cortex_search, SALES_SEMANTIC_MODEL"
+                    )
+                
+                with col2:
+                    tool_output_type = st.selectbox(
+                        "Tool output type",
+                        ["SQL", "Search results", "Custom"],
+                        key=f"add_tool_output_type_{i}"
+                    )
+                
+                tool_output_value = st.text_area(
+                    "Tool output",
+                    key=f"add_tool_output_{i}",
+                    height=80,
+                    placeholder="Enter the expected tool output..."
+                )
+                
+                if tool_name:
+                    tool_output_dict = {}
+                    if tool_output_type == "SQL":
+                        tool_output_dict["SQL"] = tool_output_value
+                    elif tool_output_type == "Search results":
+                        tool_output_dict["search results"] = tool_output_value
                     else:
-                        new_row_dict[col] = None
-                new_row = pd.DataFrame([new_row_dict])
-                st.session_state.editing_df = pd.concat([df, new_row], ignore_index=True)
+                        tool_output_dict["CUSTOM_TOOL_RESULT"] = tool_output_value
+                    
+                    tools.append({
+                        "tool_sequence": i + 1,
+                        "tool_name": tool_name,
+                        "tool_output": tool_output_dict
+                    })
+                
+                if i < int(num_tools) - 1:
+                    st.divider()
+            
+            submit_button = st.form_submit_button("➕ Add record to dataset", type="primary")
+        
+        if submit_button:
+            if not input_query or not agent_response:
+                st.error("❌ Please fill in both input query and expected agent response")
+            else:
+                record = create_manual_record(input_query, agent_response, tools)
+                new_row = pd.DataFrame([record])
+                
+                if st.session_state.dataset is None or len(st.session_state.dataset) == 0:
+                    st.session_state.dataset = new_row
+                else:
+                    st.session_state.dataset = pd.concat([st.session_state.dataset, new_row], ignore_index=True)
+                
+                st.toast(f"✅ Record added! Total: {len(st.session_state.dataset)}", icon="✅")
                 st.rerun()
-            
-            # Display editable dataframe
-            st.markdown("**Edit the dataset below. Double-click cells to edit values. You can also delete rows by selecting them.**")
-            edited_df = st.data_editor(
-                df,
-                use_container_width=True,
-                height=400,
-                num_rows="dynamic",
-                key="data_editor"
-            )
-            
-            # Update session state with edited data (data_editor automatically tracks changes)
-            st.session_state.editing_df = edited_df
+        
+        st.divider()
+        
+        if st.session_state.dataset is not None and len(st.session_state.dataset) > 0:
+            st.subheader("Current dataset preview")
+            st.dataframe(st.session_state.dataset, use_container_width=True, hide_index=True, height=300)
+        else:
+            st.info("No records yet. Add your first record using the form above.")
+    
+    with tabs[2]:
+        st.header("Review & edit dataset")
+        st.caption("Review your records and make final edits")
+        
+        if st.session_state.dataset is not None and len(st.session_state.dataset) > 0:
+            st.metric("Total records", len(st.session_state.dataset))
             
             st.divider()
             
-            # Save section
-            st.subheader("💾 Save Changes to Snowflake Table")
+            st.subheader("Edit individual records")
+            st.caption("Select a record to edit using the form below")
             
-            col1, col2, col3 = st.columns([3, 1, 1])
+            record_options = [f"Record {i+1}: {row['INPUT_QUERY'][:60]}..." for i, row in st.session_state.dataset.iterrows()]
             
-            with col1:
-                save_table_name = st.text_input(
-                    "Table Name (Use DATABASE.SCHEMA.TABLE_NAME format)",
-                    value=f"AGENT_EVAL_DB.{agent_name or 'EVAL_SETS'}.EVAL_DATASET_v0",
-                    placeholder=f"AGENT_EVAL_DB.{agent_name or 'EVAL_SETS'}.EVAL_DATASET_v0",
-                    help="Enter full path (DATABASE.SCHEMA.TABLE)",
-                    key="save_table_name"
+            record_index = st.selectbox(
+                "Select record to edit",
+                range(len(st.session_state.dataset)),
+                format_func=lambda x: record_options[x],
+                key="edit_record_selector"
+            )
+            
+            current_record = st.session_state.dataset.iloc[record_index]
+            
+            # Safe extraction with null handling
+            current_tools = current_record['EXPECTED_TOOLS'].get('ground_truth_invocations', []) if isinstance(current_record['EXPECTED_TOOLS'], dict) else []
+            current_response = current_record['EXPECTED_TOOLS'].get('ground_truth_output', '') if isinstance(current_record['EXPECTED_TOOLS'], dict) else ''
+            current_query = str(current_record['INPUT_QUERY']) if pd.notna(current_record['INPUT_QUERY']) else ''
+            
+            with st.form(f"edit_form_{record_index}"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    edited_query = st.text_area(
+                        "Input query",
+                        value=current_query,
+                        height=150,
+                        key=f"edit_query_{record_index}"
+                    )
+                
+                with col2:
+                    edited_response = st.text_area(
+                        "Expected agent response",
+                        value=str(current_response) if pd.notna(current_response) else '',
+                        height=150,
+                        key=f"edit_response_{record_index}"
+                    )
+                
+                st.divider()
+                st.markdown("**Tool invocations**")
+                
+                num_tools_edit = st.number_input(
+                    "Number of tools",
+                    min_value=0,
+                    max_value=10,
+                    value=len(current_tools) if current_tools else 0,
+                    step=1,
+                    key=f"num_tools_edit_{record_index}"
                 )
-            
-            with col2:
-                save_overwrite = st.checkbox("Overwrite table", value=False, help="If checked, will drop and recreate the table", key="save_overwrite")
-            
-            st.write("")  # Spacing
-            st.write("")  # Spacing
-            
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                if st.button("💾 Save Changes", type="primary"):
-                    if save_table_name.strip():
-                        with st.spinner("Saving changes to table..."):
-                            # edited_df['EXPECTED_TOOLS'] = edited_df.EXPECTED_TOOLS.apply(lambda x: json.loads(x))
-                            write_df = edited_df[['INPUT_QUERY', 'EXPECTED_TOOLS']]
-                            session.sql(f"CREATE OR REPLACE TABLE {save_table_name.strip()} (INPUT_QUERY VARCHAR,EXPECTED_TOOLS VARIANT);")
-                            success = write_to_table(session, write_df, save_table_name.strip(), overwrite=save_overwrite)
-                            # session.sql(f'UPDATE {save_table_name.strip()} SET EXPECTED_TOOLS = PARSE_JSON(EXPECTED_TOOLS)')
-                            
-                            # session.sql(f"""CREATE OR REPLACE TABLE {save_table_name.strip()} 
-                            #                 AS SELECT INPUT_QUERY, PARSE_JSON(EXPECTED_TOOLS) AS EXPECTED_TOOLS
-                            #                 FROM {save_table_name.strip()} ;""")
-
-                            
-                            if success:
-                                st.success(f"✅ Successfully saved {len(edited_df)} rows to {save_table_name}")
-                                st.session_state.editing_df = edited_df.copy()
+                
+                edited_tools = []
+                for i in range(int(num_tools_edit)):
+                    st.markdown(f"**Tool {i+1}**")
+                    
+                    if i < len(current_tools) and current_tools[i]:
+                        tool_data = current_tools[i]
+                        default_name = tool_data.get('tool_name', '') if isinstance(tool_data, dict) else ''
+                        default_output = tool_data.get('tool_output', {}) if isinstance(tool_data, dict) else {}
+                        
+                        if isinstance(default_output, dict):
+                            if 'SQL' in default_output:
+                                default_type = "SQL"
+                                default_value = str(default_output.get('SQL', ''))
+                            elif 'search results' in default_output:
+                                default_type = "Search results"
+                                default_value = str(default_output.get('search results', ''))
                             else:
-                                st.error("❌ Failed to save data to table")
+                                default_type = "Custom"
+                                default_value = str(default_output.get('CUSTOM_TOOL_RESULT', ''))
+                        else:
+                            default_type = "SQL"
+                            default_value = ''
                     else:
+                        default_name = ''
+                        default_type = "SQL"
+                        default_value = ''
+                    
+                    col1, col2 = st.columns([2, 3])
+                    
+                    with col1:
+                        tool_name_edit = st.text_input(
+                            "Tool name",
+                            value=default_name,
+                            key=f"edit_tool_name_{record_index}_{i}"
+                        )
+                    
+                    with col2:
+                        tool_type_index = ["SQL", "Search results", "Custom"].index(default_type) if default_type in ["SQL", "Search results", "Custom"] else 0
+                        tool_output_type_edit = st.selectbox(
+                            "Tool output type",
+                            ["SQL", "Search results", "Custom"],
+                            index=tool_type_index,
+                            key=f"edit_tool_type_{record_index}_{i}"
+                        )
+                    
+                    tool_output_value_edit = st.text_area(
+                        "Tool output",
+                        value=default_value,
+                        height=80,
+                        key=f"edit_tool_output_{record_index}_{i}"
+                    )
+                    
+                    if tool_name_edit:
+                        tool_output_dict = {}
+                        if tool_output_type_edit == "SQL":
+                            tool_output_dict["SQL"] = tool_output_value_edit
+                        elif tool_output_type_edit == "Search results":
+                            tool_output_dict["search results"] = tool_output_value_edit
+                        else:
+                            tool_output_dict["CUSTOM_TOOL_RESULT"] = tool_output_value_edit
+                        
+                        edited_tools.append({
+                            "tool_sequence": i + 1,
+                            "tool_name": tool_name_edit,
+                            "tool_output": tool_output_dict
+                        })
+                    
+                    if i < int(num_tools_edit) - 1:
+                        st.divider()
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    save_button = st.form_submit_button("💾 Save changes", type="primary")
+                with col2:
+                    delete_button = st.form_submit_button("🗑️ Delete record", type="secondary")
+            
+            if save_button:
+                updated_record = create_manual_record(edited_query, edited_response, edited_tools)
+                st.session_state.dataset.at[record_index, 'INPUT_QUERY'] = updated_record['INPUT_QUERY']
+                st.session_state.dataset.at[record_index, 'EXPECTED_TOOLS'] = updated_record['EXPECTED_TOOLS']
+                st.toast("✅ Record updated!", icon="✅")
+                st.rerun()
+            
+            if delete_button:
+                st.session_state.dataset = st.session_state.dataset.drop(record_index).reset_index(drop=True)
+                st.toast("🗑️ Record deleted", icon="🗑️")
+                st.rerun()
+            
+            st.divider()
+            st.subheader("All records")
+            st.dataframe(st.session_state.dataset, use_container_width=True, hide_index=True, height=300)
+        else:
+            st.warning("No records in dataset. Go to 'Load logs' or 'Add records' tab to get started.")
+    
+    with tabs[3]:
+        st.header("Export dataset")
+        st.caption("Export your evaluation dataset to Snowflake or download as CSV")
+        
+        if st.session_state.dataset is not None and len(st.session_state.dataset) > 0:
+            st.success(f"✅ Dataset ready with {len(st.session_state.dataset)} records")
+            
+            st.subheader("Dataset preview")
+            st.dataframe(st.session_state.dataset, use_container_width=True, hide_index=True, height=300)
+            
+            st.divider()
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("💾 Save to Snowflake")
+                table_name = st.text_input(
+                    "Table name",
+                    value="AGENT_EVAL_DB.PUBLIC.EVAL_DATASET",
+                    placeholder="DATABASE.SCHEMA.TABLE_NAME",
+                    key="export_table_name"
+                )
+                
+                save_mode = st.radio("Save mode", ["Append", "Overwrite"], horizontal=True, key="export_save_mode")
+                
+                if st.button("📤 Save to Snowflake", type="primary"):
+                    if not table_name.strip():
                         st.warning("⚠️ Please enter a table name")
+                    elif not validate_table_name(table_name):
+                        st.error("❌ Invalid table name format. Use DATABASE.SCHEMA.TABLE")
+                    else:
+                        with st.spinner("Saving to Snowflake..."):
+                            try:
+                                overwrite = (save_mode == "Overwrite")
+                                table_upper = table_name.strip().upper()
+                                
+                                # Create or replace table with proper schema
+                                if overwrite:
+                                    session.sql(f"CREATE OR REPLACE TABLE {table_upper} (INPUT_QUERY VARCHAR, EXPECTED_TOOLS VARIANT);").collect()
+                                else:
+                                    session.sql(f"CREATE TABLE IF NOT EXISTS {table_upper} (INPUT_QUERY VARCHAR, EXPECTED_TOOLS VARIANT);").collect()
+                                
+                                # Prepare data - convert to proper format
+                                records_to_insert = []
+                                for _, row in st.session_state.dataset.iterrows():
+                                    query_val = str(row['INPUT_QUERY']) if pd.notna(row['INPUT_QUERY']) else ''
+                                    tools_dict = row['EXPECTED_TOOLS'] if pd.notna(row['EXPECTED_TOOLS']) else {}
+                                    records_to_insert.append((query_val, json.dumps(tools_dict)))
+                                
+                                # Create temp dataframe with properly formatted data
+                                temp_df = pd.DataFrame(records_to_insert, columns=['INPUT_QUERY', 'EXPECTED_TOOLS_JSON'])
+                                
+                                # Write to temp staging table using write_pandas
+                                temp_table = f"{table_upper}_TEMP_STAGING"
+                                session.sql(f"CREATE OR REPLACE TEMP TABLE {temp_table} (INPUT_QUERY VARCHAR, EXPECTED_TOOLS_JSON VARCHAR);").collect()
+                                
+                                # Use write_pandas for temp table (handles escaping properly)
+                                # Snowpark Session.write_pandas returns (success: bool, nrows: int)
+                                write_result = session.write_pandas(
+                                    temp_df,
+                                    temp_table,
+                                    auto_create_table=False,
+                                    quote_identifiers=False
+                                )
+                                
+                                # Handle return value - could be tuple of 2 or 4 values depending on version
+                                if isinstance(write_result, tuple):
+                                    if len(write_result) == 2:
+                                        success, nrows = write_result
+                                    elif len(write_result) == 4:
+                                        success, nchunks, nrows, output = write_result
+                                    else:
+                                        success = write_result[0]
+                                        nrows = len(temp_df)
+                                else:
+                                    success = write_result
+                                    nrows = len(temp_df)
+                                
+                                if success:
+                                    # Copy from temp to final table with PARSE_JSON
+                                    insert_sql = f"""
+                                    INSERT INTO {table_upper} (INPUT_QUERY, EXPECTED_TOOLS)
+                                    SELECT INPUT_QUERY, PARSE_JSON(EXPECTED_TOOLS_JSON)
+                                    FROM {temp_table}
+                                    """
+                                    session.sql(insert_sql).collect()
+                                    
+                                    # Verify records were inserted
+                                    count_result = session.sql(f"SELECT COUNT(*) as cnt FROM {table_upper}").collect()
+                                    actual_count = count_result[0]['CNT']
+                                    
+                                    st.toast(f"✅ Saved {nrows} records to {table_name} (Total in table: {actual_count})", icon="✅")
+                                else:
+                                    st.error("❌ Failed to write records to staging table")
+                                
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                                st.error(traceback.format_exc())
             
             with col2:
-                # Download edited CSV
-                csv = edited_df.to_csv(index=False)
+                st.subheader("📥 Download CSV")
+                st.caption("Download the dataset as a CSV file for local use")
+                
+                csv = st.session_state.dataset.to_csv(index=False)
                 st.download_button(
-                    label="📥 Download Edited CSV",
+                    label="📥 Download CSV",
                     data=csv,
-                    file_name=f"edited_dataset_{save_table_name.replace('.', '_') if save_table_name else 'dataset'}.csv",
-                    mime="text/csv"
+                    file_name=f"eval_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    type="primary"
                 )
         else:
-            st.info("👈 Load data using the options above to start editing")
-else:
+            st.warning("No records in dataset. Go to 'Load logs' or 'Add records' tab to build your dataset.")
     st.info("👈 Please connect to Snowflake using the sidebar")
     
-    # Show connection requirements
-    with st.expander("📝 Connection Requirements"):
+    with st.expander("📝 Connection requirements"):
         st.markdown("""
         Required environment variables:
         - `SNOWFLAKE_ACCOUNT` - Your Snowflake account identifier
@@ -627,10 +781,6 @@ else:
         - `SNOWFLAKE_ROLE` (default: ACCOUNTADMIN)
         """)
 
-# Footer
 st.divider()
-st.markdown(
-    "<small>AI Observability Events Query Tool | Query results are limited to optimize performance</small>",
-    unsafe_allow_html=True
-)
+st.caption("AI evaluation dataset builder | Powered by Snowflake")
 
