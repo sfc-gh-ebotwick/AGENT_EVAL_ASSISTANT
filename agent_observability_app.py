@@ -24,7 +24,7 @@ if 'query_executed' not in st.session_state:
 def get_snowflake_connection():
     """Get or create Snowflake connection (cached)"""
     try:
-        session = Session.get_active_sessioan()
+        session = Session.get_active_session()
         return session
     except Exception:
         try:
@@ -47,12 +47,11 @@ def get_agent_list(_session) -> List[str]:
     """Get list of agents (cached for 5 minutes)"""
     try:
         agents_df = _session.sql('SHOW AGENTS IN ACCOUNT').to_pandas()
-        st.write(agents_df.columns)
         
         # Debug: show what columns we have
         
         # Look for 'name' column specifically (the agent name, not ID)
-        name_column = 1
+        name_column = "name"
         for col in agents_df.columns:
             col_str = str(col).strip('"').lower()
             if col_str == 'name':
@@ -269,9 +268,15 @@ def execute_query_and_postprocess(_session, query: str) -> pd.DataFrame:
         
             return s
 
+        #Clean up text
         df['INPUT_QUERY'] = df['INPUT_QUERY'].apply(clean_text)
         df['AGENT_RESPONSE'] = df['AGENT_RESPONSE'].apply(clean_text)
+
+        #Drop Duplicates
         df.drop_duplicates(subset=['AGENT_NAME', 'INPUT_QUERY'], inplace=True)
+        
+        #Drop any NA records
+        df = df[df['INPUT_QUERY'].notna()]
         
         #Create tool selection sequence
         df['TOOL_CALLING'] = df['TOOL_ARRAY'].apply(lambda x: add_tool_sequence(ast.literal_eval(x)))
@@ -537,7 +542,8 @@ if session:
             st.subheader("Edit individual records")
             st.caption("Select a record to edit using the form below")
             
-            record_options = [f"Record {i+1}: {row['INPUT_QUERY'][:60]}..." for i, row in st.session_state.dataset.iterrows()]
+            record_options = [f"Record {i+1}: {row['INPUT_QUERY'][:60]}..." if row['INPUT_QUERY'] is not None else 'None' for i, row in st.session_state.dataset.iterrows()]
+
             
             record_index = st.selectbox(
                 "Select record to edit",
