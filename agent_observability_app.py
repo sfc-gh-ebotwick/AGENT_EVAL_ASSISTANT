@@ -47,7 +47,33 @@ def get_agent_list(_session) -> List[str]:
     """Get list of agents (cached for 5 minutes)"""
     try:
         agents_df = _session.sql('SHOW AGENTS IN ACCOUNT').to_pandas()
-        return sorted(agents_df['"name"'].values.tolist())
+        st.write(agents_df.columns)
+        
+        # Debug: show what columns we have
+        
+        # Look for 'name' column specifically (the agent name, not ID)
+        name_column = 1
+        for col in agents_df.columns:
+            col_str = str(col).strip('"').lower()
+            if col_str == 'name':
+                name_column = col
+                break
+        
+        # If we found the name column, use it
+        if name_column is not None:
+            agent_names = agents_df[name_column].dropna().astype(str).tolist()
+            return sorted([name for name in agent_names if name])
+        
+        # Fallback: try to find any column with 'name' in it
+        for col in agents_df.columns:
+            col_str = str(col).strip('"').lower()
+            if 'name' in col_str and 'database' not in col_str and 'schema' not in col_str:
+                agent_names = agents_df[col].dropna().astype(str).tolist()
+                return sorted([name for name in agent_names if name and not name.isdigit()])
+        
+        # Last resort: return empty
+        st.warning("Could not find agent names in SHOW AGENTS result")
+        return []
     except Exception as e:
         st.error(f"Failed to load agents: {e}")
         return []
