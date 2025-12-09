@@ -1,6 +1,6 @@
 # AI Evaluation Dataset Builder for Cortex Agents
 
-A Streamlit application to build evaluation datasets for (**Snowflake Cortex Agent Evaluations**)[https://docs.snowflake.com/LIMITEDACCESS/cortex-agent-evaluations] (Private Preview). This tool helps you create, manage, and export evaluation datasets by combining agent observability logs with manually created test cases.
+A Streamlit application to build evaluation datasets for [**Snowflake Cortex Agent Evaluations**](https://docs.snowflake.com/LIMITEDACCESS/cortex-agent-evaluations) (Private Preview). This tool helps you create, manage, and export evaluation datasets by combining agent observability logs with manually created test cases.
 
 ## Overview
 
