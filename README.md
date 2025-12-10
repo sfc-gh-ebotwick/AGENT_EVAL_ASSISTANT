@@ -44,14 +44,17 @@ This tool streamlines the process of building high-quality evaluation datasets f
 ## Setup
 
 ### Option 1: Run in Streamlit in Snowflake
+#### 1. Using Git integration or just copy/paste - bring the agent_observability_app.py code into a Streamlit in Snowflake app.
+#### 2. Install necessary packages by copying contents of environment.yaml or manually installing necessary packages
 
-### 1. Install Dependencies
+### Option 2: Run in Local Streamlit
+#### 1. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure Environment Variables
+#### 2. Configure Environment Variables
 
 Create a `.env` file in the `agent_eval_assistant` directory or set environment variables:
 
@@ -65,7 +68,7 @@ SNOWFLAKE_SCHEMA=LOCAL          # Optional, defaults to LOCAL
 SNOWFLAKE_ROLE=ACCOUNTADMIN     # Optional, defaults to ACCOUNTADMIN
 ```
 
-### 3. Run the Application
+#### 3. Run the Application
 
 ```bash
 streamlit run agent_observability_app.py
