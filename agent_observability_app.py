@@ -48,36 +48,22 @@ def get_agent_list(_session) -> List[str]:
     try:
         agents_df = _session.sql('SHOW AGENTS IN ACCOUNT').to_pandas()
         
-        # Debug: show what columns we have
+        #Get agent name
+        agent_names = agents_df['"name"'].dropna().astype(str).tolist()
         
-        # Look for 'name' column specifically (the agent name, not ID)
-        name_column = "name"
-        for col in agents_df.columns:
-            col_str = str(col).strip('"').lower()
-            if col_str == 'name':
-                name_column = col
-                break
+        sorted_agent_names = sorted([name for name in agent_names if name])
+        agent_dbs = agents_df['"database_name"']
+        agent_schemas = agents_df['"schema_name"']        
+
+        agent_df = agents_df[['"database_name"', '"schema_name"', '"name"']]
+        agent_df['"fully_qualified_agent_name"'] = agent_df['"database_name"']+"." + agent_df['"schema_name"'] + "." + agents_df['"name"']
+        return agent_df
         
-        # If we found the name column, use it
-        if name_column is not None:
-            agent_names = agents_df[name_column].dropna().astype(str).tolist()
-            return sorted([name for name in agent_names if name])
-        
-        # Fallback: try to find any column with 'name' in it
-        for col in agents_df.columns:
-            col_str = str(col).strip('"').lower()
-            if 'name' in col_str and 'database' not in col_str and 'schema' not in col_str:
-                agent_names = agents_df[col].dropna().astype(str).tolist()
-                return sorted([name for name in agent_names if name and not name.isdigit()])
-        
-        # Last resort: return empty
-        st.warning("Could not find agent names in SHOW AGENTS result")
-        return []
     except Exception as e:
         st.error(f"Failed to load agents: {e}")
         return []
 
-def build_query(agent_name: str, record_id: Optional[str] = None, user_feedback: Optional[str] = None) -> str:
+def build_query(agent_name: str, agent_db_name: str, agent_schema_name: str, record_id: Optional[str] = None, user_feedback: Optional[str] = None) -> str:
     """Build the query with optional filters for AGENT_NAME and THREAD_ID"""
     
     base_query = f"""
@@ -131,8 +117,8 @@ WITH RESULTS AS (SELECT
     RECORD:"name" as OPERATION
     
     FROM TABLE(SNOWFLAKE.LOCAL.GET_AI_OBSERVABILITY_EVENTS(
-    'SNOWFLAKE_INTELLIGENCE', 
-    'AGENTS', 
+    '{agent_db_name}', 
+    '{agent_schema_name}', 
     '{agent_name}', 
     'CORTEX AGENT'))"""
     
@@ -383,9 +369,13 @@ if session:
         
         col1, col2 = st.columns([2, 1])
         with col1:
-            agent_list = get_agent_list(session)
+            agent_df = get_agent_list(session)
+            agent_list = sorted(agent_df['"name"'].dropna().astype(str).tolist())
             if agent_list:
                 agent_name = st.selectbox("Select your agent name", agent_list, key="agent_select")
+                agent_db_name = agent_df['"database_name"'][agent_df['"name"']==agent_name].values[0]
+                agent_schema_name = agent_df['"schema_name"'][agent_df['"name"']==agent_name].values[0]
+                agent_fq_name = agent_df['"fully_qualified_agent_name"'][agent_df['"name"']==agent_name].values[0]                
             else:
                 agent_name = st.text_input("Agent name", key="agent_input")
         
@@ -404,6 +394,8 @@ if session:
                 try:
                     query = build_query(
                         agent_name=agent_name,
+                        agent_db_name = agent_db_name,
+                        agent_schema_name = agent_schema_name,
                         record_id=record_id.strip() if record_id else None,
                         user_feedback=user_feedback
                     )
@@ -467,11 +459,20 @@ if session:
                 col1, col2 = st.columns([2, 3])
                 
                 with col1:
-                    tool_name = st.text_input(
+                    agent_desc_df = session.sql(f'DESCRIBE AGENT {agent_fq_name}').to_pandas()
+                    agent_tool_list = [i['tool_spec']['name'] for i in json.loads(agent_desc_df['"agent_spec"'][0])['tools']]
+
+                    tool_name = st.selectbox(
                         "Tool name",
+                        agent_tool_list,
                         key=f"add_tool_name_{i}",
-                        placeholder="e.g., cortex_search, SALES_SEMANTIC_MODEL"
+                        # placeholder="e.g., cortex_search, SALES_SEMANTIC_MODEL"
                     )
+                    # tool_name = st.text_input(
+                    #     "Tool name",
+                    #     key=f"add_tool_name_{i}",
+                    #     placeholder="e.g., cortex_search, SALES_SEMANTIC_MODEL"
+                    # )
                 
                 with col2:
                     tool_output_type = st.selectbox(
