@@ -25,6 +25,11 @@ def get_snowflake_connection():
     """Get or create Snowflake connection (cached)"""
     try:
         session = Session.get_active_session()
+        # Verify session is actually valid by checking if it has a connection
+        if session is None:
+            raise ValueError("Session is None")
+        # Test the session by running a simple query
+        session.sql("SELECT 1").collect()
         return session
     except Exception:
         try:
@@ -46,21 +51,24 @@ def get_snowflake_connection():
 def get_agent_list(_session) -> List[str]:
     """Get list of agents (cached for 5 minutes)"""
     try:
-        agents_df = _session.sql('SHOW AGENTS IN ACCOUNT').to_pandas()
+        # Use RESULT_SCAN to get reliable column names from SHOW command
+        _session.sql('SHOW AGENTS IN ACCOUNT').collect()
         
-        #Get agent name
-        agent_names = agents_df['"name"'].dropna().astype(str).tolist()
-        
-        sorted_agent_names = sorted([name for name in agent_names if name])
-        agent_dbs = agents_df['"database_name"']
-        agent_schemas = agents_df['"schema_name"']        
+        agents_df = _session.sql('SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))').to_pandas()
 
-        agent_df = agents_df[['"database_name"', '"schema_name"', '"name"']]
-        agent_df['"fully_qualified_agent_name"'] = agent_df['"database_name"']+"." + agent_df['"schema_name"'] + "." + agents_df['"name"']
+        # Now we can reliably access columns - they should be properly named
+        # Column names are typically quoted: "name", "database_name", "schema_name"
+        agent_df = agents_df[["database_name", "schema_name", "name"]].copy()
+        agent_df['"fully_qualified_agent_name"'] = (
+            agent_df["database_name"] + "." + 
+            agent_df["schema_name"] + "." + 
+            agent_df["name"]
+        )
         return agent_df
         
     except Exception as e:
         st.error(f"Failed to load agents: {e}")
+        st.error(f"Error details: {traceback.format_exc()}")
         return []
 
 def build_query(agent_name: str, agent_db_name: str, agent_schema_name: str, record_id: Optional[str] = None, user_feedback: Optional[str] = None) -> str:
@@ -370,12 +378,12 @@ if session:
         col1, col2 = st.columns([2, 1])
         with col1:
             agent_df = get_agent_list(session)
-            agent_list = sorted(agent_df['"name"'].dropna().astype(str).tolist())
+            agent_list = sorted(agent_df["name"].dropna().astype(str).tolist())
             if agent_list:
                 agent_name = st.selectbox("Select your agent name", agent_list, key="agent_select")
-                agent_db_name = agent_df['"database_name"'][agent_df['"name"']==agent_name].values[0]
-                agent_schema_name = agent_df['"schema_name"'][agent_df['"name"']==agent_name].values[0]
-                agent_fq_name = agent_df['"fully_qualified_agent_name"'][agent_df['"name"']==agent_name].values[0]                
+                agent_db_name = agent_df["database_name"][agent_df["name"]==agent_name].values[0]
+                agent_schema_name = agent_df["schema_name"][agent_df["name"]==agent_name].values[0]
+                agent_fq_name = agent_df['"fully_qualified_agent_name"'][agent_df["name"]==agent_name].values[0]                
             else:
                 agent_name = st.text_input("Agent name", key="agent_input")
         
@@ -459,8 +467,9 @@ if session:
                 col1, col2 = st.columns([2, 3])
                 
                 with col1:
-                    agent_desc_df = session.sql(f'DESCRIBE AGENT {agent_fq_name}').to_pandas()
-                    agent_tool_list = [i['tool_spec']['name'] for i in json.loads(agent_desc_df['"agent_spec"'][0])['tools']]
+                    session.sql(f'DESCRIBE AGENT {agent_fq_name}').collect()
+                    agent_desc_df = session.sql('SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))').to_pandas()
+                    agent_tool_list = [i['tool_spec']['name'] for i in json.loads(agent_desc_df['agent_spec'][0])['tools']]
 
                     tool_name = st.selectbox(
                         "Tool name",
