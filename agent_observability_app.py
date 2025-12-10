@@ -19,6 +19,12 @@ if 'workflow_step' not in st.session_state:
     st.session_state.workflow_step = 1
 if 'query_executed' not in st.session_state:
     st.session_state.query_executed = False
+if 'agent_fq_name' not in st.session_state:
+    st.session_state.agent_fq_name = None
+if 'agent_db_name' not in st.session_state:
+    st.session_state.agent_db_name = None
+if 'agent_schema_name' not in st.session_state:
+    st.session_state.agent_schema_name = None
 
 @st.cache_resource
 def get_snowflake_connection():
@@ -316,13 +322,49 @@ def write_to_table(session, df: pd.DataFrame, table_name: str, overwrite: bool =
         st.error(f"Failed to write to table: {e}")
         return False
 
-def load_from_table(session, table_name: str) -> pd.DataFrame:
-    """Load data from Snowflake table"""
+def validate_table_schema(session, table_name: str) -> tuple[bool, str]:
+    """Validate that table has required schema (INPUT_QUERY, EXPECTED_TOOLS)"""
     try:
         target_table = table_name.upper()
-        query = f"SELECT * FROM {target_table}"
-        data = session.sql(query)
-        return data.to_pandas()
+        # Get table description
+        # desc_result = session.sql(f"DESCRIBE TABLE {target_table}").to_pandas()
+        existing_table = session.sql(f"SELECT * FROM {target_table}").to_pandas()
+        st.write(existing_table.dtypes)
+        
+        # Check for required columns
+        column_names = [col.strip('"').upper() for col in existing_table.columns.tolist()]
+        st.write(column_names)
+        
+        if 'INPUT_QUERY' not in column_names:
+            return False, "Missing required column: INPUT_QUERY"
+        if 'EXPECTED_TOOLS' not in column_names:
+            return False, "Missing required column: EXPECTED_TOOLS"
+        
+        return True, "Schema valid"
+    except Exception as e:
+        return False, f"Error validating schema: {str(e)}"
+
+def load_from_table(session, table_name: str) -> pd.DataFrame:
+    """Load data from Snowflake table with schema validation"""
+    try:
+        # Validate schema first
+        is_valid, message = validate_table_schema(session, table_name)
+        if not is_valid:
+            st.error(f"❌ Invalid table schema: {message}")
+            return pd.DataFrame()
+        
+        target_table = table_name.upper()
+        query = f"SELECT INPUT_QUERY, EXPECTED_TOOLS FROM {target_table}"
+        df = session.sql(query).to_pandas()
+        
+        # Verify data loaded
+        if df.empty:
+            st.warning("⚠️ Table exists but contains no records")
+            return df
+        
+        st.success(f"✅ Loaded {len(df)} records from {target_table}")
+        return df
+        
     except Exception as e:
         st.error(f"Failed to load from table: {e}")
         return pd.DataFrame()
@@ -339,6 +381,37 @@ def create_manual_record(input_query: str, agent_response: str, tools: List[Dict
 
 st.title("🔍 AI evaluation dataset builder")
 st.caption("Build evaluation datasets from agent logs and manual entries")
+
+# Add custom CSS to maximize width - more aggressive overrides
+st.markdown("""
+    <style>
+    /* Force full width for main content */
+    .main .block-container {
+        max-width: 95% !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+    }
+    
+    /* Remove tab panel padding */
+    .stTabs [data-baseweb="tab-panel"] {
+        padding: 0 !important;
+    }
+    
+    /* Force dataframe to use full width */
+    div[data-testid="stDataFrame"] {
+        width: 100% !important;
+    }
+    
+    div[data-testid="stDataFrame"] > div {
+        width: 100% !important;
+    }
+    
+    /* Remove padding from elements containing dataframes */
+    div[data-testid="column"] {
+        padding: 0 !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
 session = get_snowflake_connection()
 
@@ -369,65 +442,152 @@ with st.sidebar:
         st.session_state.query_executed = False
         st.rerun()
 if session:
-    tabs = st.tabs(["📥 1. Load logs", "➕ 2. Add records", "✏️ 3. Review & edit", "📤 4. Export"])
+    tabs = st.tabs(["📥 1. Load Data", "➕ 2. Add records", "✏️ 3. Review & edit", "📤 4. Export"])
     
     with tabs[0]:
-        st.header("Load existing logs")
-        st.caption("Start with agent observability logs to build your evaluation dataset")
+        st.header("Load Data")
+        st.caption("Load data from agent logs or existing tables")
         
-        col1, col2 = st.columns([2, 1])
+        # Put data source and load mode side by side with stacked radio buttons
+        col1, col2 = st.columns(2)
+        
         with col1:
-            agent_df = get_agent_list(session)
-            agent_list = sorted(agent_df["name"].dropna().astype(str).tolist())
-            if agent_list:
-                agent_name = st.selectbox("Select your agent name", agent_list, key="agent_select")
-                agent_db_name = agent_df["database_name"][agent_df["name"]==agent_name].values[0]
-                agent_schema_name = agent_df["schema_name"][agent_df["name"]==agent_name].values[0]
-                agent_fq_name = agent_df['"fully_qualified_agent_name"'][agent_df["name"]==agent_name].values[0]                
-            else:
-                agent_name = st.text_input("Agent name", key="agent_input")
+            data_source = st.radio(
+                "Data source",
+                ["From Agent Logs", "From Existing Table"],
+                key="data_source_selector"
+            )
         
         with col2:
-            record_id = st.text_input("Record ID (optional)", value="", key="record_id_input")
-        
-        user_feedback = st.selectbox(
-            "Filter by user feedback",
-            [None, "Positive Feedback Only", "Negative Feedback Only", "Any Feedback"],
-            index=0,
-            key="feedback_filter"
-        )
-        
-        if st.button("📥 Load from agent logs", type="primary", disabled=not agent_name):
-            with st.spinner("Querying agent logs..."):
-                try:
-                    query = build_query(
-                        agent_name=agent_name,
-                        agent_db_name = agent_db_name,
-                        agent_schema_name = agent_schema_name,
-                        record_id=record_id.strip() if record_id else None,
-                        user_feedback=user_feedback
-                    )
-                    df = execute_query_and_postprocess(session, query)
-                    
-                    if st.session_state.dataset is None or len(st.session_state.dataset) == 0:
-                        st.session_state.dataset = df[['INPUT_QUERY', 'EXPECTED_TOOLS']].copy()
-                    else:
-                        new_records = df[['INPUT_QUERY', 'EXPECTED_TOOLS']].copy()
-                        st.session_state.dataset = pd.concat([st.session_state.dataset, new_records], ignore_index=True)
-                    
-                    st.toast(f"✅ Loaded {len(df)} records from logs", icon="✅")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error loading logs: {e}")
+            load_mode = st.radio(
+                "Load mode",
+                ["Replace", "Append"],
+                help="Replace: Clear current dataset and load new data\nAppend: Add new records to current dataset",
+                key="load_mode_global"
+            )
         
         st.divider()
         
+        if data_source == "From Agent Logs":
+            st.subheader("📥 Load from agent observability logs")
+            
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                agent_df = get_agent_list(session)
+                agent_list = sorted(agent_df["name"].dropna().astype(str).tolist())
+                if agent_list:
+                    agent_name = st.selectbox("Select your agent name", agent_list, key="agent_select")
+                    agent_db_name = agent_df["database_name"][agent_df["name"]==agent_name].values[0]
+                    agent_schema_name = agent_df["schema_name"][agent_df["name"]==agent_name].values[0]
+                    agent_fq_name = agent_df['"fully_qualified_agent_name"'][agent_df["name"]==agent_name].values[0]
+                    
+                    # Store in session state for use in other tabs
+                    st.session_state.agent_fq_name = agent_fq_name
+                    st.session_state.agent_db_name = agent_db_name
+                    st.session_state.agent_schema_name = agent_schema_name
+                else:
+                    agent_name = st.text_input("Agent name", key="agent_input")
+                    agent_db_name = None
+                    agent_schema_name = None
+                    agent_fq_name = None
+            
+            with col2:
+                record_id = st.text_input("Record ID (optional)", value="", key="record_id_input")
+            
+            user_feedback = st.selectbox(
+                "Filter by user feedback",
+                [None, "Positive Feedback Only", "Negative Feedback Only", "Any Feedback"],
+                index=0,
+                key="feedback_filter"
+            )
+            
+            if st.button("📥 Load from agent logs", type="primary", disabled=not agent_name):
+                with st.spinner("Querying agent logs..."):
+                    try:
+                        query = build_query(
+                            agent_name=agent_name,
+                            agent_db_name = agent_db_name,
+                            agent_schema_name = agent_schema_name,
+                            record_id=record_id.strip() if record_id else None,
+                            user_feedback=user_feedback
+                        )
+                        df = execute_query_and_postprocess(session, query)
+                        
+                        if load_mode == "Replace" or st.session_state.dataset is None or len(st.session_state.dataset) == 0:
+                            st.session_state.dataset = df[['INPUT_QUERY', 'EXPECTED_TOOLS']].copy()
+                            st.toast(f"✅ Loaded {len(df)} records (replaced existing)", icon="✅")
+                        else:  # Append mode
+                            new_records = df[['INPUT_QUERY', 'EXPECTED_TOOLS']].copy()
+                            st.session_state.dataset = pd.concat([st.session_state.dataset, new_records], ignore_index=True)
+                            st.toast(f"✅ Added {len(df)} records to dataset", icon="✅")
+                        
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error loading logs: {e}")
+        
+        else:  # From Existing Table
+            st.subheader("📊 Load from existing Snowflake table")
+            
+            # Clear agent info when loading from table
+            st.session_state.agent_fq_name = None
+            st.session_state.agent_db_name = None
+            st.session_state.agent_schema_name = None
+            
+            st.markdown("""
+            **Requirements:**
+            - Table must exist in your Snowflake account
+            - Required columns: `INPUT_QUERY` (VARCHAR), `EXPECTED_TOOLS` (VARIANT)
+            - Use format: `DATABASE.SCHEMA.TABLE` or just `TABLE` (uses current context)
+            """)
+            
+            table_input = st.text_input(
+                "Table name",
+                placeholder="e.g., MY_DATABASE.MY_SCHEMA.EVAL_DATASET or EVAL_DATASET",
+                key="load_table_input",
+                help="Enter fully qualified table name or just table name to use current database/schema"
+            )
+            
+            if st.button("📊 Load from table", type="primary", disabled=not table_input):
+                with st.spinner(f"Loading from {table_input}..."):
+                    try:
+                        loaded_df = load_from_table(session, table_input.strip())
+                        
+                        if not loaded_df.empty:
+                            if load_mode == "Replace" or st.session_state.dataset is None:
+                                st.session_state.dataset = loaded_df
+                                st.toast(f"✅ Loaded {len(loaded_df)} records (replaced existing)", icon="✅")
+                            else:  # Append mode
+                                if st.session_state.dataset is None:
+                                    st.session_state.dataset = loaded_df
+                                else:
+                                    st.session_state.dataset = pd.concat([st.session_state.dataset, loaded_df], ignore_index=True)
+                                st.toast(f"✅ Added {len(loaded_df)} records to dataset", icon="✅")
+                            st.rerun()
+                        else:
+                            st.warning("No records loaded")
+                            
+                    except Exception as e:
+                        st.error(f"Error loading table: {e}")
+                        st.error(f"Details: {traceback.format_exc()}")
+        
+        st.divider()
+        
+        # Data preview section - outside any columns for full width
         if st.session_state.dataset is not None and len(st.session_state.dataset) > 0:
-            st.success(f"✅ Current dataset has {len(st.session_state.dataset)} records")
-            st.caption("Dataset preview (showing all records):")
-            st.dataframe(st.session_state.dataset, use_container_width=True, hide_index=True, height=400)
+            st.subheader("📊 Current Dataset Preview")
+            st.success(f"✅ {len(st.session_state.dataset)} records loaded")
+            
+            # Use container to ensure full width
+            with st.container():
+                st.dataframe(
+                    st.session_state.dataset, 
+                    use_container_width=True, 
+                    hide_index=True, 
+                    height=500,
+                    width=None  # Let it take full width
+                )
         else:
-            st.info("No records loaded yet. Load logs above or go to 'Add records' tab.")
+            st.info("💡 No records loaded yet. Choose a data source above and load data to get started.")
     
     with tabs[1]:
         st.header("Add evaluation records")
@@ -467,21 +627,32 @@ if session:
                 col1, col2 = st.columns([2, 3])
                 
                 with col1:
-                    session.sql(f'DESCRIBE AGENT {agent_fq_name}').collect()
-                    agent_desc_df = session.sql('SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))').to_pandas()
-                    agent_tool_list = [i['tool_spec']['name'] for i in json.loads(agent_desc_df['agent_spec'][0])['tools']]
+                    # Check if agent info is available to show dropdown, otherwise text input
+                    if st.session_state.agent_fq_name:
+                        try:
+                            session.sql(f'DESCRIBE AGENT {st.session_state.agent_fq_name}').collect()
+                            agent_desc_df = session.sql('SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))').to_pandas()
+                            agent_tool_list = [i['tool_spec']['name'] for i in json.loads(agent_desc_df['agent_spec'][0])['tools']]
 
-                    tool_name = st.selectbox(
-                        "Tool name",
-                        agent_tool_list,
-                        key=f"add_tool_name_{i}",
-                        # placeholder="e.g., cortex_search, SALES_SEMANTIC_MODEL"
-                    )
-                    # tool_name = st.text_input(
-                    #     "Tool name",
-                    #     key=f"add_tool_name_{i}",
-                    #     placeholder="e.g., cortex_search, SALES_SEMANTIC_MODEL"
-                    # )
+                            tool_name = st.selectbox(
+                                "Tool name",
+                                agent_tool_list,
+                                key=f"add_tool_name_{i}",
+                            )
+                        except Exception:
+                            # Fallback to text input if agent description fails
+                            tool_name = st.text_input(
+                                "Tool name",
+                                key=f"add_tool_name_{i}",
+                                placeholder="e.g., cortex_search, SALES_SEMANTIC_MODEL"
+                            )
+                    else:
+                        # No agent info available, use text input
+                        tool_name = st.text_input(
+                            "Tool name",
+                            key=f"add_tool_name_{i}",
+                            placeholder="e.g., cortex_search, SALES_SEMANTIC_MODEL"
+                        )
                 
                 with col2:
                     tool_output_type = st.selectbox(
@@ -543,6 +714,12 @@ if session:
     with tabs[2]:
         st.header("Review & edit dataset")
         st.caption("Review your records and make final edits")
+        
+        # Debug info
+        st.write(f"Debug - Dataset is None: {st.session_state.dataset is None}")
+        if st.session_state.dataset is not None:
+            st.write(f"Debug - Dataset length: {len(st.session_state.dataset)}")
+            st.write(f"Debug - Dataset columns: {st.session_state.dataset.columns.tolist()}")
         
         if st.session_state.dataset is not None and len(st.session_state.dataset) > 0:
             st.metric("Total records", len(st.session_state.dataset))
@@ -807,6 +984,8 @@ if session:
                 )
         else:
             st.warning("No records in dataset. Go to 'Load logs' or 'Add records' tab to build your dataset.")
+
+else:
     st.info("👈 Please connect to Snowflake using the sidebar")
     
     with st.expander("📝 Connection requirements"):
