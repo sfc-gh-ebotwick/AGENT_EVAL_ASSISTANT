@@ -25,6 +25,8 @@ if 'agent_db_name' not in st.session_state:
     st.session_state.agent_db_name = None
 if 'agent_schema_name' not in st.session_state:
     st.session_state.agent_schema_name = None
+if 'active_tab' not in st.session_state:
+    st.session_state.active_tab = 0
 
 @st.cache_resource
 def get_snowflake_connection():
@@ -442,9 +444,40 @@ with st.sidebar:
         st.session_state.query_executed = False
         st.rerun()
 if session:
-    tabs = st.tabs(["📥 1. Load Data", "➕ 2. Add records", "✏️ 3. Review & edit", "📤 4. Export"])
+    # Create tab selection with navigation buttons at the top
+    tab_names = ["📥 1. Load Data", "➕ 2. Add records", "✏️ 3. Review & edit", "📤 4. Export"]
     
-    with tabs[0]:
+    # Navigation bar with buttons and tab selector
+    col_prev, col_tabs, col_next = st.columns([1, 8, 1])
+    
+    with col_prev:
+        if st.session_state.active_tab > 0:
+            if st.button("← Back", key="nav_prev", use_container_width=True):
+                st.session_state.active_tab -= 1
+                st.rerun()
+    
+    with col_tabs:
+        selected_tab_name = st.radio(
+            "Navigation",
+            tab_names,
+            index=st.session_state.active_tab,
+            horizontal=True,
+            label_visibility="collapsed",
+            key="tab_selector"
+        )
+        # Update active tab based on radio selection
+        st.session_state.active_tab = tab_names.index(selected_tab_name)
+    
+    with col_next:
+        if st.session_state.active_tab < len(tab_names) - 1:
+            if st.button("Next →", key="nav_next", type="primary", use_container_width=True):
+                st.session_state.active_tab += 1
+                st.rerun()
+    
+    st.divider()
+    
+    # Render content based on active tab
+    if st.session_state.active_tab == 0:
         st.header("Load Data")
         st.caption("Load data from agent logs or existing tables")
         
@@ -577,19 +610,34 @@ if session:
             st.subheader("📊 Current Dataset Preview")
             st.success(f"✅ {len(st.session_state.dataset)} records loaded")
             
+            # Format EXPECTED_TOOLS as readable JSON strings for display
+            display_df = st.session_state.dataset.copy()
+            display_df['EXPECTED_TOOLS'] = display_df['EXPECTED_TOOLS'].apply(
+                lambda x: json.dumps(x, indent=2) if pd.notna(x) else ''
+            )
+            
             # Use container to ensure full width
             with st.container():
                 st.dataframe(
-                    st.session_state.dataset, 
+                    display_df, 
                     use_container_width=True, 
                     hide_index=True, 
                     height=500,
-                    width=None  # Let it take full width
+                    column_config={
+                        "INPUT_QUERY": st.column_config.TextColumn(
+                            "Input Query",
+                            width="medium",
+                        ),
+                        "EXPECTED_TOOLS": st.column_config.TextColumn(
+                            "Expected Tools (JSON)",
+                            width="large",
+                        )
+                    }
                 )
         else:
             st.info("💡 No records loaded yet. Choose a data source above and load data to get started.")
     
-    with tabs[1]:
+    elif st.session_state.active_tab == 1:
         st.header("Add evaluation records")
         st.caption("Manually create evaluation records using the form below")
         
@@ -707,19 +755,27 @@ if session:
         
         if st.session_state.dataset is not None and len(st.session_state.dataset) > 0:
             st.subheader("Current dataset preview")
-            st.dataframe(st.session_state.dataset, use_container_width=True, hide_index=True, height=300)
+            # Format EXPECTED_TOOLS as readable JSON strings for display
+            display_df = st.session_state.dataset.copy()
+            display_df['EXPECTED_TOOLS'] = display_df['EXPECTED_TOOLS'].apply(
+                lambda x: json.dumps(x, indent=2) if pd.notna(x) else ''
+            )
+            st.dataframe(
+                display_df, 
+                use_container_width=True, 
+                hide_index=True, 
+                height=300,
+                column_config={
+                    "INPUT_QUERY": st.column_config.TextColumn("Input Query", width="medium"),
+                    "EXPECTED_TOOLS": st.column_config.TextColumn("Expected Tools (JSON)", width="large")
+                }
+            )
         else:
             st.info("No records yet. Add your first record using the form above.")
     
-    with tabs[2]:
+    elif st.session_state.active_tab == 2:
         st.header("Review & edit dataset")
         st.caption("Review your records and make final edits")
-        
-        # Debug info
-        st.write(f"Debug - Dataset is None: {st.session_state.dataset is None}")
-        if st.session_state.dataset is not None:
-            st.write(f"Debug - Dataset length: {len(st.session_state.dataset)}")
-            st.write(f"Debug - Dataset columns: {st.session_state.dataset.columns.tolist()}")
         
         if st.session_state.dataset is not None and len(st.session_state.dataset) > 0:
             st.metric("Total records", len(st.session_state.dataset))
@@ -867,11 +923,25 @@ if session:
             
             st.divider()
             st.subheader("All records")
-            st.dataframe(st.session_state.dataset, use_container_width=True, hide_index=True, height=300)
+            # Format EXPECTED_TOOLS as readable JSON strings for display
+            display_df = st.session_state.dataset.copy()
+            display_df['EXPECTED_TOOLS'] = display_df['EXPECTED_TOOLS'].apply(
+                lambda x: json.dumps(x, indent=2) if pd.notna(x) else ''
+            )
+            st.dataframe(
+                display_df, 
+                use_container_width=True, 
+                hide_index=True, 
+                height=300,
+                column_config={
+                    "INPUT_QUERY": st.column_config.TextColumn("Input Query", width="medium"),
+                    "EXPECTED_TOOLS": st.column_config.TextColumn("Expected Tools (JSON)", width="large")
+                }
+            )
         else:
             st.warning("No records in dataset. Go to 'Load logs' or 'Add records' tab to get started.")
     
-    with tabs[3]:
+    elif st.session_state.active_tab == 3:
         st.header("Export dataset")
         st.caption("Export your evaluation dataset to Snowflake or download as CSV")
         
@@ -879,7 +949,21 @@ if session:
             st.success(f"✅ Dataset ready with {len(st.session_state.dataset)} records")
             
             st.subheader("Dataset preview")
-            st.dataframe(st.session_state.dataset, use_container_width=True, hide_index=True, height=300)
+            # Format EXPECTED_TOOLS as readable JSON strings for display
+            display_df = st.session_state.dataset.copy()
+            display_df['EXPECTED_TOOLS'] = display_df['EXPECTED_TOOLS'].apply(
+                lambda x: json.dumps(x, indent=2) if pd.notna(x) else ''
+            )
+            st.dataframe(
+                display_df, 
+                use_container_width=True, 
+                hide_index=True, 
+                height=300,
+                column_config={
+                    "INPUT_QUERY": st.column_config.TextColumn("Input Query", width="medium"),
+                    "EXPECTED_TOOLS": st.column_config.TextColumn("Expected Tools (JSON)", width="large")
+                }
+            )
             
             st.divider()
             
